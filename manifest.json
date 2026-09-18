@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.nobledoodle.omlibria",
+  "name": "Omlibria",
+  "version": "1.0.0",
+  "author": "NobleDoodle",
+  "license": "MIT",
+  "description": "Native eBook reader for Omarchy. Read EPUB's directly in your Omarchy bar with simple keyboard controls and UI. Reader stays clean and follows your theme, and remembers the exact book and page you are reading.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Omlibria",
+    "description": "Open your EPUBs/Calibre library and start reading.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

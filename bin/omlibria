@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""Helper for the Omlibria Omarchy plugin.
+
+  omlibria libraries
+  omlibria scan <library>
+  omlibria prepare <library> <epub-relative-path> <cache-root>
+  omlibria chapter <file> <max-image-width> [max-image-height] [fragment]
+
+Every command prints JSON (or HTML for `chapter`) on stdout.
+"""
+import hashlib
+import html
+import json
+import os
+import posixpath
+import re
+import sqlite3
+import struct
+import sys
+import urllib.parse
+import xml.etree.ElementTree as ET
+import zipfile
+from html.parser import HTMLParser
+
+HOME = os.path.expanduser("~")
+
+# A book is untrusted input: it arrives as a zip of attacker-shaped XML, markup
+# and file names, and everything below runs inside the desktop shell's process.
+MAX_TOTAL_BYTES = 512 * 1024 * 1024   # whole extracted book
+MAX_ENTRY_BYTES = 64 * 1024 * 1024    # one file inside it
+MAX_ENTRIES = 20000
+MAX_XML_BYTES = 16 * 1024 * 1024
+MAX_CHAPTER_BYTES = 8 * 1024 * 1024
+MAX_SPINE = 20000
+
+
+def contained(path, root):
+    """`path` resolved, but only if it stays inside `root`; otherwise None.
+
+    Hrefs and file names inside a book are attacker-controlled, so every path
+    built from one is checked before it is opened or handed to the reader.
+    Resolving symlinks first means a link planted in the cache cannot step out
+    either.
+    """
+    try:
+        p = os.path.realpath(path)
+        r = os.path.realpath(root)
+    except OSError:
+        return None
+    return p if p == r or p.startswith(r + os.sep) else None
+
+
+def within(root, rel):
+    """`rel` joined onto `root`, or None if it is absolute or climbs out of it.
+
+    Paths in Calibre's metadata.db are only as trustworthy as the library, and a
+    library can be downloaded or shared. This is a lexical check on purpose: a
+    symlink you made yourself inside your own library is allowed to point out
+    of it, but a `../` written into the database is not.
+    """
+    if not rel or os.path.isabs(rel):
+        return None
+    base = os.path.normpath(root)
+    path = os.path.normpath(os.path.join(base, rel))
+    return path if path.startswith(base + os.sep) else None
+
+
+def book_root(path):
+    """The extraction directory holding `path`, or None if it is not in one.
+
+    Returning None rather than falling back to the file's own directory means
+    a path from outside any book is refused instead of being rendered.
+    """
+    d = os.path.dirname(os.path.realpath(path))
+    for _ in range(12):
+        if os.path.isfile(os.path.join(d, ".extracted")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj))
+    sys.stdout.flush()
+
+
+# --------------------------------------------------------------------------
+# libraries / scan
+# --------------------------------------------------------------------------
+
+def libraries():
+    found, seen = [], set()
+
+    def consider(path):
+        path = os.path.realpath(path)
+        if path in seen or not os.path.isfile(os.path.join(path, "metadata.db")):
+            return
+        seen.add(path)
+        found.append(path)
+
+    for name in ("Calibre Library", "Calibre", "calibre", "Books", "Documents/Calibre Library"):
+        consider(os.path.join(HOME, name))
+    for root, dirs, _ in os.walk(HOME):
+        depth = root[len(HOME):].count(os.sep)
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("node_modules", "venv")]
+        if depth >= 3:
+            dirs[:] = []
+        consider(root)
+        if len(found) >= 12:
+            break
+    out(found)
+
+
+def scan(library):
+    db = os.path.join(library, "metadata.db")
+    if not os.path.isfile(db):
+        out({"error": "No metadata.db in " + library, "books": []})
+        return
+    con = sqlite3.connect("file:%s?mode=ro&immutable=1" % urllib.parse.quote(db), uri=True)
+    con.row_factory = sqlite3.Row
+    # The database may not be ours: refuse anything a crafted schema could run.
+    con.execute("PRAGMA trusted_schema = OFF")
+    con.execute("PRAGMA query_only = ON")
+    authors = {}
+    for r in con.execute(
+        "SELECT l.book AS book, a.name AS name FROM books_authors_link l "
+        "JOIN authors a ON a.id = l.author ORDER BY l.id"
+    ):
+        authors.setdefault(r["book"], []).append(r["name"].replace("|", ","))
+    series = {}
+    for r in con.execute(
+        "SELECT l.book AS book, s.name AS name FROM books_series_link l JOIN series s ON s.id = l.series"
+    ):
+        series[r["book"]] = r["name"]
+    epubs = {}
+    for r in con.execute("SELECT book, name FROM data WHERE upper(format) = 'EPUB'"):
+        epubs[r["book"]] = r["name"]
+    books = []
+    for r in con.execute(
+        "SELECT id, title, sort, path, has_cover, series_index, timestamp FROM books"
+    ):
+        name = epubs.get(r["id"])
+        if not name:
+            continue
+        rel = posixpath.join(r["path"], name + ".epub")
+        epub_path = within(library, rel)
+        if not epub_path or not os.path.isfile(epub_path):
+            continue          # missing, or the database points outside the library
+        cover = within(library, posixpath.join(r["path"], "cover.jpg")) or ""
+        books.append({
+            "id": r["id"],
+            "key": rel,
+            "title": r["title"],
+            "sort": (r["sort"] or r["title"]).lower(),
+            "authors": ", ".join(authors.get(r["id"], [])) or "Unknown",
+            "series": series.get(r["id"], ""),
+            "seriesIndex": r["series_index"] or 0,
+            "cover": cover if r["has_cover"] and cover and os.path.isfile(cover) else "",
+            "added": r["timestamp"] or "",
+        })
+    con.close()
+    out({"error": "", "books": books})
+
+
+# --------------------------------------------------------------------------
+# epub extraction
+# --------------------------------------------------------------------------
+
+def local(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def read_xml(path):
+    with open(path, "rb") as f:
+        data = f.read(MAX_XML_BYTES + 1)
+    if len(data) > MAX_XML_BYTES:
+        raise ValueError("XML file is too large")
+    # ElementTree does not fetch external entities, but it will happily expand
+    # nested internal ones until the process runs out of memory.
+    if re.search(rb"<!DOCTYPE[^>]*\[", data, re.I) or re.search(rb"<!ENTITY", data, re.I):
+        raise ValueError("XML entity declarations are not allowed")
+    return ET.fromstring(data)
+
+
+def text_weight(path):
+    """Roughly how much reading a spine file holds, for global page estimates."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            raw = f.read(MAX_CHAPTER_BYTES)
+    except OSError:
+        return 0
+    raw = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", raw)
+    body = re.search(r"(?is)<body[^>]*>(.*?)</body>", raw)
+    if body:
+        raw = body.group(1)
+    images = len(re.findall(r"(?i)<img\b", raw))
+    raw = html.unescape(re.sub(r"(?s)<[^>]+>", " ", raw))
+    return len(re.sub(r"\s+", " ", raw).strip()) + images * 600
+
+
+def prepare(library, rel, cache_root):
+    epub = within(library, rel)
+    if not epub or not os.path.isfile(epub):
+        out({"error": "That book is not inside the library"})
+        return
+    st = os.stat(epub)
+    key = hashlib.sha1(("%s|%d|%d" % (rel, st.st_size, int(st.st_mtime))).encode()).hexdigest()[:16]
+    dest = os.path.join(cache_root, key)
+    marker = os.path.join(dest, ".extracted")
+    if not os.path.isfile(marker):
+        # Extracted books are the user's private files: keep them private.
+        os.makedirs(cache_root, mode=0o700, exist_ok=True)
+        os.makedirs(dest, mode=0o700, exist_ok=True)
+        # makedirs leaves an existing directory alone, so tighten those made by
+        # earlier versions too.
+        os.chmod(cache_root, 0o700)
+        os.chmod(dest, 0o700)
+        total = 0
+        with zipfile.ZipFile(epub) as z:
+            for count, m in enumerate(z.infolist()):
+                if count >= MAX_ENTRIES:
+                    break
+                if m.is_dir():
+                    continue
+                target = contained(os.path.join(dest, m.filename), dest)
+                if not target:
+                    continue          # entry tries to escape the cache directory
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                # Copy with a cap on real bytes: a zip header can understate
+                # how much it expands to, so the declared size proves nothing.
+                written = 0
+                with z.open(m) as src, open(target, "wb") as dst:
+                    while True:
+                        chunk = src.read(65536)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        total += len(chunk)
+                        if written > MAX_ENTRY_BYTES or total > MAX_TOTAL_BYTES:
+                            dst.close()
+                            os.unlink(target)
+                            raise ValueError("Book expands to more than this reader will extract")
+                        dst.write(chunk)
+        open(marker, "w").close()
+
+    # The cache directory is keyed by the file's size and mtime, so a cached
+    # listing can never be stale for a different book.
+    meta_path = os.path.join(dest, ".omlibria-meta.json")
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        if meta.get("v") == 3 and all(contained(i["file"], dest) for i in meta["spine"]):
+            out(meta)
+            return
+    except Exception:
+        pass
+
+    container = read_xml(os.path.join(dest, "META-INF", "container.xml"))
+    opf_rel = None
+    for el in container.iter():
+        if local(el.tag) == "rootfile":
+            opf_rel = el.get("full-path")
+            break
+    if not opf_rel:
+        out({"error": "Not a valid EPUB (no rootfile)"})
+        return
+    opf_path = contained(os.path.join(dest, opf_rel), dest)
+    if not opf_path:
+        out({"error": "EPUB points outside itself"})
+        return
+    opf_dir = posixpath.dirname(opf_rel)
+    opf = read_xml(opf_path)
+
+    manifest, title = {}, ""
+    spine_ids, ncx_id, nav_href = [], None, None
+    for el in opf.iter():
+        t = local(el.tag)
+        if t == "item":
+            manifest[el.get("id")] = {
+                "href": el.get("href", ""),
+                "type": el.get("media-type", ""),
+                "props": el.get("properties", ""),
+            }
+        elif t == "title" and not title:
+            title = (el.text or "").strip()
+        elif t == "spine":
+            ncx_id = el.get("toc")
+        elif t == "itemref":
+            if el.get("linear", "yes") != "no":
+                spine_ids.append(el.get("idref"))
+
+    def abs_for(href):
+        href = urllib.parse.unquote(href.split("#")[0])
+        return contained(os.path.join(dest, opf_dir, href), dest)
+
+    spine, by_file = [], {}
+    for i, sid in enumerate(spine_ids[:MAX_SPINE]):
+        item = manifest.get(sid)
+        if not item:
+            continue
+        path = abs_for(item["href"])
+        if not path:
+            continue
+        by_file[path] = len(spine)
+        spine.append({"file": path, "title": ""})
+    if not spine:
+        out({"error": "EPUB has an empty reading order"})
+        return
+
+    toc = []
+
+    def add_toc(label, href):
+        idx = by_file.get(abs_for(href))
+        label = re.sub(r"\s+", " ", label or "").strip()
+        if idx is not None and label:
+            toc.append({"title": label, "spine": idx})
+
+    for item in manifest.values():
+        if "nav" in item["props"].split():
+            nav_href = item["href"]
+    if nav_href:
+        try:
+            nav_path = abs_for(nav_href)
+            nav_dir = os.path.dirname(nav_path)   # abs_for returned None if it escaped
+            raw = open(nav_path, encoding="utf-8", errors="replace").read()
+            m = re.search(r"<nav[^>]*epub:type=[\"'][^\"']*toc[^\"']*[\"'].*?</nav>", raw, re.S)
+            block = m.group(0) if m else raw
+            for a in re.finditer(r"<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", block, re.S):
+                label = html.unescape(re.sub(r"<[^>]+>", "", a.group(2)))
+                href = os.path.normpath(os.path.join(nav_dir, urllib.parse.unquote(a.group(1).split("#")[0])))
+                idx = by_file.get(href)
+                label = re.sub(r"\s+", " ", label).strip()
+                if idx is not None and label:
+                    toc.append({"title": label, "spine": idx})
+        except Exception:
+            toc = []
+    if not toc and ncx_id and ncx_id in manifest:
+        try:
+            ncx_path = abs_for(manifest[ncx_id]["href"])
+            ncx_dir = os.path.dirname(ncx_path)
+            for el in read_xml(ncx_path).iter():
+                if local(el.tag) != "navPoint":
+                    continue
+                label = ""
+                src = ""
+                for ch in el:
+                    if local(ch.tag) == "navLabel":
+                        label = "".join(ch.itertext())
+                    elif local(ch.tag) == "content":
+                        src = ch.get("src", "")
+                href = os.path.normpath(os.path.join(ncx_dir, urllib.parse.unquote(src.split("#")[0])))
+                idx = by_file.get(href)
+                label = re.sub(r"\s+", " ", label).strip()
+                if idx is not None and label:
+                    toc.append({"title": label, "spine": idx})
+        except Exception:
+            toc = []
+    if not toc:
+        toc = [{"title": "Section %d" % (i + 1), "spine": i} for i in range(len(spine))]
+    # Keep the first entry per spine file so "current chapter" lookups stay stable.
+    first = {}
+    for t in toc:
+        first.setdefault(t["spine"], t["title"])
+    for idx, label in first.items():
+        spine[idx]["title"] = label
+
+    for item in spine:
+        item["chars"] = text_weight(item["file"])
+
+    result = {"v": 3, "error": "", "dir": dest, "title": title, "spine": spine, "toc": toc}
+    try:
+        with open(meta_path, "w") as f:
+            json.dump(result, f)
+    except OSError:
+        pass
+    out(result)
+
+
+# --------------------------------------------------------------------------
+# chapter -> Qt rich text
+# --------------------------------------------------------------------------
+
+def image_size(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+            if head[:8] == b"\x89PNG\r\n\x1a\n":
+                return struct.unpack(">II", head[16:24])
+            if head[:6] in (b"GIF87a", b"GIF89a"):
+                return struct.unpack("<HH", head[6:10])
+            if head[:2] == b"\xff\xd8":
+                f.seek(2)
+                for _ in range(1024):
+                    b = f.read(1)
+                    while b and b != b"\xff":
+                        b = f.read(1)
+                    while b == b"\xff":
+                        b = f.read(1)
+                    if not b:
+                        return None
+                    marker = b[0]
+                    if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                        f.read(3)
+                        h, w = struct.unpack(">HH", f.read(4))
+                        return w, h
+                    seg = struct.unpack(">H", f.read(2))[0]
+                    if seg < 2:
+                        return None      # a crafted length would seek backwards for ever
+                    f.seek(seg - 2, 1)
+    except Exception:
+        return None
+    return None
+
+
+def parse_css(text, rules):
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    for m in re.finditer(r"([^{}@]+)\{([^{}]*)\}", text):
+        props = {}
+        for decl in m.group(2).split(";"):
+            if ":" in decl:
+                k, v = decl.split(":", 1)
+                props[k.strip().lower()] = v.strip().lower()
+        wanted = {}
+        if props.get("font-style") in ("italic", "oblique"):
+            wanted["i"] = True
+        fw = props.get("font-weight", "")
+        if fw == "bold" or (fw.isdigit() and int(fw) >= 600):
+            wanted["b"] = True
+        if props.get("text-align") in ("center", "right", "justify"):
+            wanted["align"] = props["text-align"]
+        if props.get("text-decoration", "").startswith("underline"):
+            wanted["u"] = True
+        if not wanted:
+            continue
+        for sel in m.group(1).split(","):
+            sel = sel.strip()
+            if re.fullmatch(r"[a-z0-9]*(\.[\w-]+)?", sel, re.I) and sel:
+                rules.setdefault(sel.lower(), {}).update(wanted)
+
+
+SKIP = {"head", "script", "style", "title"}
+WRAPPERS = {"div", "section", "article", "figure", "figcaption", "aside", "header", "footer", "nav", "main", "body", "html"}
+MARKER = "\u2063"      # invisible separator: marks a link target to land on
+LINK_OPEN = "\u2062"   # invisible times: brackets a link so the reader can find it
+LINK_CLOSE = "\u2064"  # invisible plus
+SENTINELS = (MARKER, LINK_OPEN, LINK_CLOSE)
+LINE_SPREAD = 1.4       # slack for the reader's paragraph line-height
+TEXT_BLOCKS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "pre", "td", "th", "blockquote"}
+
+
+class Converter(HTMLParser):
+    """Turns XHTML into the small HTML subset Qt's rich text understands."""
+
+    def __init__(self, path, max_w, max_h, rules, fragment=""):
+        super().__init__(convert_charrefs=True)
+        self.path, self.base = path, os.path.dirname(path)
+        self.root = book_root(path)
+        self.max_w, self.max_h = max_w, max_h
+        self.rules, self.fragment = rules, fragment
+        self.marker_due = False   # an invisible marker precedes the next text
+        self.o = []
+        self.stack = []      # (tag, closing html, is_wrapper)
+        self.skip = 0
+        self.pre = 0
+        self.blk = 0         # depth of explicit text blocks (p, h1, li, ...)
+        self.wrap_open = False
+        self.last_text = False
+
+    def styles_for(self, tag, attrs):
+        cls = (dict(attrs).get("class") or "").lower().split()
+        found = {}
+        for key in [tag] + ["." + c for c in cls] + ["%s.%s" % (tag, c) for c in cls]:
+            found.update(self.rules.get(key, {}))
+        return found
+
+    def close_wrapper(self):
+        if self.wrap_open:
+            self.o.append("</p>")
+            self.wrap_open = False
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in SKIP:
+            self.skip += 1
+            return
+        if self.skip:
+            return
+        a = dict(attrs)
+        if self.fragment and self.fragment in (a.get("id"), a.get("name")):
+            self.marker_due = True
+        if tag in ("img", "image"):
+            src = a.get("src") or a.get("xlink:href") or a.get("href")
+            if src:
+                self.close_wrapper()
+                self.emit_image(src)
+            return
+        if tag == "br":
+            self.o.append("<br/>")
+            return
+        if tag == "hr":
+            self.close_wrapper()
+            self.o.append("<hr/>")
+            return
+        styles = self.styles_for(tag, attrs)
+        name = {"strong": "b", "em": "i"}.get(tag, tag)
+        if name in WRAPPERS:
+            self.stack.append((tag, "", True))
+            return
+        open_html = close_html = ""
+        link = self.link_for(a.get("href")) if name == "a" else None
+        if link:
+            # A link opening outside any block would otherwise have the lazy
+            # paragraph wrapper land inside the anchor.
+            if not self.blk and not self.wrap_open:
+                self.o.append("<p>")
+                self.wrap_open = True
+            open_html = '<a href="%s">%s' % (html.escape(link, quote=True), LINK_OPEN)
+            close_html = LINK_CLOSE + "</a>"
+        elif name in ("b", "i", "u", "sup", "sub", "s", "code", "tt"):
+            open_html, close_html = "<%s>" % name, "</%s>" % name
+        elif name in ("ul", "ol", "li", "table", "tr", "td", "th", "pre", "blockquote",
+                      "h1", "h2", "h3", "h4", "h5", "h6", "p"):
+            self.close_wrapper()
+            align = styles.get("align")
+            attr = ' align="%s"' % align if align and name in ("p", "h1", "h2", "h3", "h4", "h5", "h6") else ""
+            open_html, close_html = "<%s%s>" % (name, attr), "</%s>" % name
+            if name == "pre":
+                self.pre += 1
+            if name in TEXT_BLOCKS:
+                self.blk += 1
+        # inline styling coming from CSS classes
+        if styles.get("i"):
+            open_html += "<i>"
+            close_html = "</i>" + close_html
+        if styles.get("b") and not name.startswith("h"):
+            open_html += "<b>"
+            close_html = "</b>" + close_html
+        if styles.get("u"):
+            open_html += "<u>"
+            close_html = "</u>" + close_html
+        self.o.append(open_html)
+        self.stack.append((tag, close_html, False))
+
+    def handle_startendtag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in ("img", "image", "br", "hr"):
+            self.handle_starttag(tag, attrs)
+        else:
+            self.handle_starttag(tag, attrs)
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in SKIP:
+            self.skip = max(0, self.skip - 1)
+            return
+        if self.skip:
+            return
+        for i in range(len(self.stack) - 1, -1, -1):
+            if self.stack[i][0] != tag:
+                continue
+            for t, close_html, wrapper in reversed(self.stack[i:]):
+                if wrapper:
+                    self.close_wrapper()
+                    continue
+                self.o.append(close_html)
+                if t == "pre":
+                    self.pre = max(0, self.pre - 1)
+                if t in TEXT_BLOCKS:
+                    self.blk = max(0, self.blk - 1)
+            del self.stack[i:]
+            return
+
+    def handle_data(self, data):
+        if self.skip:
+            return
+        for ch in SENTINELS:
+            if ch in data:
+                data = data.replace(ch, "")   # never let a book's own text look like a sentinel
+        if not self.pre:
+            data = re.sub(r"\s+", " ", data)
+            if not data.strip() and not self.last_text:
+                return
+        if not data:
+            return
+        if not self.blk and not self.wrap_open and data.strip():
+            # Loose text inside a div: give it its own paragraph.
+            self.o.append("<p>")
+            self.wrap_open = True
+        if self.marker_due and data.strip():
+            self.o.append(MARKER)
+            self.marker_due = False
+        self.o.append(html.escape(data, quote=False))
+        self.last_text = True
+
+    def link_for(self, href):
+        """Internal links become epub:<abs path>#<fragment>; web links pass through."""
+        if not href:
+            return None
+        if href.startswith(("http:", "https:")):
+            return href
+        if ":" in href.split("#")[0]:
+            return None  # mailto:, javascript:, ...
+        target, _, frag = href.partition("#")
+        path = self.path if not target else contained(
+            os.path.join(self.base, urllib.parse.unquote(target)), self.root)
+        if not path:
+            return None        # link points outside the book
+        return "epub:" + urllib.parse.quote(path) + ("#" + urllib.parse.quote(frag) if frag else "")
+
+    def emit_image(self, src):
+        if src.startswith(("http:", "https:", "data:")):
+            return
+        path = contained(os.path.join(self.base, urllib.parse.unquote(src.split("#")[0])), self.root)
+        if not path or not os.path.isfile(path):
+            return             # image source outside the book, or missing
+        size = image_size(path)
+        attrs = ""
+        # A standalone image goes in its own block. That block is a div rather
+        # than a paragraph so the reader's paragraph line-height does not apply
+        # to it: the renderer multiplies the whole line box, image included,
+        # which would make a full-page image too tall to fit on a page. An
+        # image sitting inside a paragraph of text cannot escape that, so it is
+        # held to the height that stays within a page once multiplied.
+        limit = self.max_h if not self.blk else self.max_h / LINE_SPREAD
+        if size and size[0] and size[1]:
+            w, h = float(size[0]), float(size[1])
+            if w > self.max_w:
+                h, w = h * self.max_w / w, float(self.max_w)
+            if limit and h > limit:
+                w, h = w * limit / h, limit
+            attrs = ' width="%d" height="%d"' % (max(1, int(w)), max(1, int(h)))
+        elif self.max_w:
+            attrs = ' width="%d"' % self.max_w
+        img = '<img src="file://%s"%s/>' % (urllib.parse.quote(path), attrs)
+        self.o.append(img if self.blk else '<div align="center">%s</div>' % img)
+        self.last_text = False
+
+
+def chapter(path, max_w, max_h=0, fragment=""):
+    base = os.path.dirname(path)
+    root = book_root(path)
+    if not root or not contained(path, root):
+        sys.stdout.write("<p>This section is not part of the book.</p>")
+        return
+    with open(path, encoding="utf-8", errors="replace") as f:
+        raw = f.read(MAX_CHAPTER_BYTES)
+    rules = {}
+    for m in re.finditer(r"<link[^>]+href=[\"']([^\"']+\.css)[\"']", raw, re.I):
+        css = contained(os.path.join(base, urllib.parse.unquote(m.group(1))), root)
+        if not css:
+            continue           # stylesheet outside the book
+        try:
+            with open(css, encoding="utf-8", errors="replace") as f:
+                parse_css(f.read(MAX_CHAPTER_BYTES), rules)
+        except OSError:
+            pass
+    for m in re.finditer(r"<style[^>]*>(.*?)</style>", raw, re.S | re.I):
+        parse_css(m.group(1), rules)
+    # XHTML self-closing on non-void tags confuses HTMLParser (e.g. <div/>).
+    raw = re.sub(r"<(div|span|p|a|section)([^>]*)/>", r"<\1\2></\1>", raw)
+    conv = Converter(path, max_w, max_h, rules, fragment)
+    conv.feed(raw)
+    conv.close()
+    body = "".join(conv.o).strip()
+    if not re.sub(r"<[^>]+>", "", body).strip() and "<img" not in body:
+        body = '<p align="center">&#8226; &#8226; &#8226;</p>'
+    sys.stdout.write(body)
+
+
+def main(argv):
+    if len(argv) < 2:
+        print(__doc__)
+        return 2
+    cmd = argv[1]
+    try:
+        if cmd == "libraries":
+            libraries()
+        elif cmd == "scan":
+            scan(argv[2])
+        elif cmd == "prepare":
+            prepare(argv[2], argv[3], argv[4])
+        elif cmd == "chapter":
+            chapter(argv[2], int(float(argv[3])),
+                    int(float(argv[4])) if len(argv) > 4 else 0,
+                    argv[5] if len(argv) > 5 else "")
+        else:
+            print(__doc__)
+            return 2
+    except Exception as e:  # surface to QML instead of a silent empty stdout
+        if cmd == "chapter":
+            sys.stdout.write("<p>Could not render this section: %s</p>" % html.escape(str(e)))
+        else:
+            out({"error": "%s: %s" % (type(e).__name__, e), "books": []})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
