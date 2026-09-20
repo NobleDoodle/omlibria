@@ -17,6 +17,7 @@ import re
 import sqlite3
 import struct
 import sys
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
@@ -32,6 +33,25 @@ MAX_ENTRIES = 20000
 MAX_XML_BYTES = 16 * 1024 * 1024
 MAX_CHAPTER_BYTES = 8 * 1024 * 1024
 MAX_SPINE = 20000
+
+# A Calibre library is chosen by the user but its metadata.db may have been
+# downloaded or shared, so its size, row counts and text lengths are all
+# attacker-chosen. Every one of them is bounded before it reaches memory, and
+# the helper refuses a library rather than streaming an unbounded answer into
+# the long-lived shell process that reads this output.
+MAX_DB_BYTES = 256 * 1024 * 1024      # metadata.db itself
+MAX_BOOKS = 20000                     # book rows, and entries in any per-book map
+MAX_LINK_ROWS = 200000                # author/series/format rows examined
+MAX_AUTHORS_PER_BOOK = 8
+MAX_TEXT = 300                        # characters kept from a title, author or series
+MAX_PATH_TEXT = 1024                  # characters kept from a stored path or file name
+MAX_STDOUT_BYTES = 16 * 1024 * 1024   # anything this helper prints
+SCAN_SECONDS = 20.0                   # wall-clock deadline for one library scan
+SCAN_PROGRESS_STEPS = 1000            # how often SQLite checks that deadline
+
+
+class LibraryRefused(Exception):
+    """A library exceeded one of the bounds above and was not opened."""
 
 
 def contained(path, root):
@@ -82,9 +102,35 @@ def book_root(path):
     return None
 
 
-def out(obj):
-    sys.stdout.write(json.dumps(obj))
+def write_out(payload):
+    """Print one response, or a short refusal if it exceeds the output ceiling.
+
+    Every result this helper produces goes through here, so this is where the
+    ceiling is enforced: the reader never has to buffer or parse more than
+    MAX_STDOUT_BYTES no matter what a library or book contains.
+    """
+    if len(payload.encode("utf-8")) > MAX_STDOUT_BYTES:
+        payload = "<p>This section is larger than this reader will read.</p>"
+    sys.stdout.write(payload)
     sys.stdout.flush()
+
+
+def out(obj):
+    """Print one JSON response, or a short refusal if it would be too large.
+
+    This is the only place the helper writes a result, so it is also the place
+    the output ceiling is enforced: the reader never has to buffer or parse
+    more than MAX_STDOUT_BYTES no matter what a library or book contains.
+    """
+    payload = json.dumps(obj)
+    size = len(payload.encode("utf-8"))
+    if size > MAX_STDOUT_BYTES:
+        payload = json.dumps({
+            "error": "This library returned more data than this reader will read "
+                     "(%d MB)." % (size // (1024 * 1024)),
+            "books": [],
+        })
+    write_out(payload)
 
 
 # --------------------------------------------------------------------------
@@ -114,54 +160,123 @@ def libraries():
     out(found)
 
 
+def bounded(cursor, limit, what):
+    """Yield rows, refusing the library if it produces more than `limit` of them.
+
+    Iterating rather than fetching keeps SQLite's own buffer small; the caller
+    is responsible for bounding whatever it retains.
+    """
+    count = 0
+    for row in cursor:
+        count += 1
+        if count > limit:
+            cursor.close()
+            raise LibraryRefused(
+                "This library lists more %s than this reader will open (limit %d)." % (what, limit))
+        yield row
+
+
+def open_library(db):
+    """Open metadata.db read-only, with a wall-clock deadline on every query."""
+    # No `immutable=1`: that promises SQLite the file cannot change underneath
+    # it and lets it skip validation, which is not a promise an untrusted or
+    # shared library can keep.
+    con = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(db), uri=True)
+    con.row_factory = sqlite3.Row
+    # The database may not be ours: refuse anything a crafted schema could run.
+    con.execute("PRAGMA trusted_schema = OFF")
+    con.execute("PRAGMA query_only = ON")
+    # A crafted database can make a simple-looking join do unbounded work, so
+    # give the whole scan a deadline. Returning non-zero aborts the statement.
+    deadline = time.monotonic() + SCAN_SECONDS
+    con.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, SCAN_PROGRESS_STEPS)
+    return con
+
+
 def scan(library):
     db = os.path.join(library, "metadata.db")
     if not os.path.isfile(db):
         out({"error": "No metadata.db in " + library, "books": []})
         return
-    con = sqlite3.connect("file:%s?mode=ro&immutable=1" % urllib.parse.quote(db), uri=True)
-    con.row_factory = sqlite3.Row
-    # The database may not be ours: refuse anything a crafted schema could run.
-    con.execute("PRAGMA trusted_schema = OFF")
-    con.execute("PRAGMA query_only = ON")
-    authors = {}
-    for r in con.execute(
-        "SELECT l.book AS book, a.name AS name FROM books_authors_link l "
-        "JOIN authors a ON a.id = l.author ORDER BY l.id"
-    ):
-        authors.setdefault(r["book"], []).append(r["name"].replace("|", ","))
-    series = {}
-    for r in con.execute(
-        "SELECT l.book AS book, s.name AS name FROM books_series_link l JOIN series s ON s.id = l.series"
-    ):
-        series[r["book"]] = r["name"]
-    epubs = {}
-    for r in con.execute("SELECT book, name FROM data WHERE upper(format) = 'EPUB'"):
-        epubs[r["book"]] = r["name"]
-    books = []
-    for r in con.execute(
-        "SELECT id, title, sort, path, has_cover, series_index, timestamp FROM books"
-    ):
-        name = epubs.get(r["id"])
-        if not name:
-            continue
-        rel = posixpath.join(r["path"], name + ".epub")
-        epub_path = within(library, rel)
-        if not epub_path or not os.path.isfile(epub_path):
-            continue          # missing, or the database points outside the library
-        cover = within(library, posixpath.join(r["path"], "cover.jpg")) or ""
-        books.append({
-            "id": r["id"],
-            "key": rel,
-            "title": r["title"],
-            "sort": (r["sort"] or r["title"]).lower(),
-            "authors": ", ".join(authors.get(r["id"], [])) or "Unknown",
-            "series": series.get(r["id"], ""),
-            "seriesIndex": r["series_index"] or 0,
-            "cover": cover if r["has_cover"] and cover and os.path.isfile(cover) else "",
-            "added": r["timestamp"] or "",
-        })
-    con.close()
+    size = os.path.getsize(db)
+    if size > MAX_DB_BYTES:
+        out({"error": "This library's metadata.db is larger than this reader will open "
+                      "(%d MB)." % (size // (1024 * 1024)), "books": []})
+        return
+
+    con = open_library(db)
+    try:
+        # Every text column is truncated by SQLite itself, so an oversized
+        # title or author name is never materialized in this process at all.
+        authors = {}
+        for r in bounded(con.execute(
+            "SELECT l.book AS book, substr(a.name, 1, ?) AS name FROM books_authors_link l "
+            "JOIN authors a ON a.id = l.author ORDER BY l.id", (MAX_TEXT,)),
+                MAX_LINK_ROWS, "author entries"):
+            names = authors.setdefault(r["book"], [])
+            if len(authors) > MAX_BOOKS:
+                raise LibraryRefused(
+                    "This library lists authors for more than %d books." % MAX_BOOKS)
+            if len(names) < MAX_AUTHORS_PER_BOOK:
+                names.append((r["name"] or "").replace("|", ","))
+
+        series = {}
+        for r in bounded(con.execute(
+            "SELECT l.book AS book, substr(s.name, 1, ?) AS name FROM books_series_link l "
+            "JOIN series s ON s.id = l.series", (MAX_TEXT,)),
+                MAX_LINK_ROWS, "series entries"):
+            if len(series) >= MAX_BOOKS and r["book"] not in series:
+                raise LibraryRefused(
+                    "This library lists series for more than %d books." % MAX_BOOKS)
+            series[r["book"]] = r["name"] or ""
+
+        epubs = {}
+        for r in bounded(con.execute(
+            "SELECT book, substr(name, 1, ?) AS name FROM data WHERE upper(format) = 'EPUB'",
+            (MAX_PATH_TEXT,)), MAX_LINK_ROWS, "EPUB entries"):
+            if len(epubs) >= MAX_BOOKS and r["book"] not in epubs:
+                raise LibraryRefused(
+                    "This library lists more than %d EPUBs." % MAX_BOOKS)
+            epubs[r["book"]] = r["name"] or ""
+
+        books = []
+        for r in bounded(con.execute(
+            "SELECT id, substr(title, 1, ?) AS title, substr(sort, 1, ?) AS sort, "
+            "substr(path, 1, ?) AS path, has_cover, series_index, "
+            "substr(timestamp, 1, 64) AS timestamp FROM books",
+            (MAX_TEXT, MAX_TEXT, MAX_PATH_TEXT)), MAX_BOOKS, "books"):
+            name = epubs.get(r["id"])
+            if not name:
+                continue
+            rel = posixpath.join(r["path"] or "", name + ".epub")
+            epub_path = within(library, rel)
+            if not epub_path or not os.path.isfile(epub_path):
+                continue          # missing, or the database points outside the library
+            cover = within(library, posixpath.join(r["path"] or "", "cover.jpg")) or ""
+            title = r["title"] or ""
+            books.append({
+                "id": r["id"],
+                "key": rel,
+                "title": title,
+                "sort": (r["sort"] or title).lower(),
+                "authors": ", ".join(authors.get(r["id"], [])) or "Unknown",
+                "series": series.get(r["id"], ""),
+                "seriesIndex": r["series_index"] or 0,
+                "cover": cover if r["has_cover"] and cover and os.path.isfile(cover) else "",
+                "added": r["timestamp"] or "",
+            })
+    except sqlite3.OperationalError as e:
+        # The progress handler aborts a statement by returning non-zero, which
+        # surfaces here as "interrupted".
+        out({"error": "This library took too long to read and was stopped."
+                      if "interrupt" in str(e).lower() else "Could not read this library: %s" % e,
+             "books": []})
+        return
+    except LibraryRefused as e:
+        out({"error": str(e), "books": []})
+        return
+    finally:
+        con.close()
     out({"error": "", "books": books})
 
 
@@ -644,7 +759,7 @@ def chapter(path, max_w, max_h=0, fragment=""):
     base = os.path.dirname(path)
     root = book_root(path)
     if not root or not contained(path, root):
-        sys.stdout.write("<p>This section is not part of the book.</p>")
+        write_out("<p>This section is not part of the book.</p>")
         return
     with open(path, encoding="utf-8", errors="replace") as f:
         raw = f.read(MAX_CHAPTER_BYTES)
@@ -668,7 +783,7 @@ def chapter(path, max_w, max_h=0, fragment=""):
     body = "".join(conv.o).strip()
     if not re.sub(r"<[^>]+>", "", body).strip() and "<img" not in body:
         body = '<p align="center">&#8226; &#8226; &#8226;</p>'
-    sys.stdout.write(body)
+    write_out(body)
 
 
 def main(argv):
@@ -692,7 +807,7 @@ def main(argv):
             return 2
     except Exception as e:  # surface to QML instead of a silent empty stdout
         if cmd == "chapter":
-            sys.stdout.write("<p>Could not render this section: %s</p>" % html.escape(str(e)))
+            write_out("<p>Could not render this section: %s</p>" % html.escape(str(e)))
         else:
             out({"error": "%s: %s" % (type(e).__name__, e), "books": []})
     return 0

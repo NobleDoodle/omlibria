@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.nobledoodle.omlibria",
   "name": "Omlibria",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "NobleDoodle",
   "license": "MIT",
   "description": "Native eBook reader for Omarchy. Read EPUB's directly in your Omarchy bar with simple keyboard controls and UI. Reader stays clean and follows your theme, and remembers the exact book and page you are reading.",

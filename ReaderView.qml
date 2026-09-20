@@ -57,12 +57,18 @@ FocusScope {
   property int linkIndex: -1         // Tab-selected link on this chapter, -1 for none
   property int layoutTick: 0         // bumped after each layout, to refresh link geometry
 
+  // The page's text. It is created fresh for every chapter (see `bodyHost`), so it
+  // is null while a chapter is loading and everything that reads it must allow that.
+  readonly property Item body: bodyHost.item
+
   // Every link in this chapter, in reading order. The helper brackets each one
   // with invisible sentinels, which is the only way to recover where a link
   // sits: rich text exposes no list of its anchors.
   readonly property var links: {
-    var tick = layoutTick, n = body.length
-    var plain = body.getText(0, n), out = []
+    var tick = layoutTick, text = body
+    if (!text) return []
+    var n = text.length
+    var plain = text.getText(0, n), out = []
     var i = 0
     while (true) {
       var a = plain.indexOf("\u2062", i)
@@ -77,7 +83,7 @@ FocusScope {
 
   readonly property rect linkBox: {
     var tick = layoutTick
-    if (linkIndex < 0 || linkIndex >= links.length) return Qt.rect(0, 0, 0, 0)
+    if (!body || linkIndex < 0 || linkIndex >= links.length) return Qt.rect(0, 0, 0, 0)
     var a = body.positionToRectangle(links[linkIndex].start)
     var b = body.positionToRectangle(links[linkIndex].end)
     if (Math.abs(a.y - b.y) < 1)
@@ -154,7 +160,10 @@ FocusScope {
   // `keep` leaves the old text on screen while the new one loads (used for re-layout).
   function loadChapter(idx, pos, dir, fragment, keep) {
     if (idx < 0 || idx >= spine.length) return
-    if (!keep) chapterHtml = ""      // release the old document first
+    if (!keep) {                     // a new chapter: drop the old text and its item
+      chapterHtml = ""
+      bodyHost.active = false
+    }
     linkIndex = -1
     spineIndex = idx
     anchorPos = pos
@@ -176,10 +185,27 @@ FocusScope {
     id: chapterProc
     property int serial: 0
     stdout: StdioCollector {
+      property bool overflowed: false
+      onDataChanged: {
+        // Same ceiling the service applies: stop before the chapter is buffered
+        // any further or turned into a document.
+        if (!overflowed && data && svc && data.byteLength > svc.maxResponseBytes) {
+          overflowed = true
+          chapterProc.running = false
+        }
+      }
       onStreamFinished: {
         if (chapterProc.serial !== root.loadSerial) return
         root.awaitingHtml = false
+        if (overflowed) {
+          overflowed = false
+          root.chapterHtml = "<p>This section is larger than Omlibria will read.</p>"
+          bodyHost.active = true
+          settle.restart()
+          return
+        }
         root.chapterHtml = text
+        bodyHost.active = true       // a fresh text item, already holding the new text
         settle.restart()
       }
     }
@@ -253,7 +279,7 @@ FocusScope {
   }
 
   function applyAnchor() {
-    if (spineIndex < 0 || awaitingHtml) return
+    if (spineIndex < 0 || awaitingHtml || !body) return
     computePages()
     var pos = anchorPos
     if (pendingFragment) {
@@ -397,6 +423,7 @@ FocusScope {
 
   // A tap on a link follows it; otherwise the page edges turn pages.
   function tapAt(x, y) {
+    if (!body) return
     var p = body.mapFromItem(input, x, y)
     var href = body.linkAt(p.x, p.y)
     if (href) followLink(href)
@@ -594,32 +621,40 @@ FocusScope {
     interactive: false
     contentWidth: width
     // Slack below the text so the last page can start on a page boundary.
-    contentHeight: body.height + root.padTop + root.padBottom + height
+    contentHeight: (body ? body.height : 0) + root.padTop + root.padBottom + height
     boundsBehavior: Flickable.StopAtBounds
     opacity: root.slideOp
     transform: Translate { x: root.slideX }
 
     onHeightChanged: if (root.spineIndex >= 0) settle.restart()
 
-    TextEdit {
-      id: body
-      x: Math.round((flick.width - width) / 2)
-      y: root.padTop
-      width: root.textWidth
-      readOnly: true
-      enabled: false                 // pure display; taps are handled by the overlay below
-      selectByMouse: false
-      textFormat: TextEdit.RichText
-      wrapMode: TextEdit.Wrap
-      color: root.fg
-      selectedTextColor: root.fg
-      font { family: root.bodyFont; pixelSize: root.fontSize }
-      // TextEdit has no lineHeight property; Qt's rich text takes it from CSS.
-      text: "<style>p, li, h1, h2, h3, h4, h5, h6, td, blockquote { line-height: " + Math.round(root.lineMult * 100)
-        + "%; } p { margin-top: 0; margin-bottom: " + Math.round(root.fontSize * 0.55)
-        + "px; } h1, h2, h3, h4 { margin-top: 12px; margin-bottom: 12px; }"
-        + " a { color: " + root.accent + "; text-decoration: underline; }</style>" + root.chapterHtml
-      onContentHeightChanged: if (root.spineIndex >= 0) settle.restart()
+    // Each chapter gets a brand-new TextEdit. A reused one can stop painting after its
+    // document is swapped for another large one and the scroll position jumps: the
+    // page numbers and geometry are all correct, but nothing is drawn until the text
+    // happens to be laid out again. A newly created item always paints on first show,
+    // which is why opening a book worked while following a link out of one did not.
+    Loader {
+      id: bodyHost
+      active: false
+      sourceComponent: TextEdit {
+        x: Math.round((flick.width - width) / 2)
+        y: root.padTop
+        width: root.textWidth
+        readOnly: true
+        enabled: false                 // pure display; taps are handled by the overlay below
+        selectByMouse: false
+        textFormat: TextEdit.RichText
+        wrapMode: TextEdit.Wrap
+        color: root.fg
+        selectedTextColor: root.fg
+        font { family: root.bodyFont; pixelSize: root.fontSize }
+        // TextEdit has no lineHeight property; Qt's rich text takes it from CSS.
+        text: "<style>p, li, h1, h2, h3, h4, h5, h6, td, blockquote { line-height: " + Math.round(root.lineMult * 100)
+          + "%; } p { margin-top: 0; margin-bottom: " + Math.round(root.fontSize * 0.55)
+          + "px; } h1, h2, h3, h4 { margin-top: 12px; margin-bottom: 12px; }"
+          + " a { color: " + root.accent + "; text-decoration: underline; }</style>" + root.chapterHtml
+        onContentHeightChanged: if (root.spineIndex >= 0) settle.restart()
+      }
     }
 
     // Inside the Flickable: linkBox is in the text's own coordinates, so the
@@ -627,8 +662,8 @@ FocusScope {
     // viewport, where it only lined up on the first page.
     Rectangle {
       visible: root.linkIndex >= 0 && root.linkBox.width > 0
-      x: body.x + root.linkBox.x - 3
-      y: body.y + root.linkBox.y - 1
+      x: (body ? body.x : 0) + root.linkBox.x - 3
+      y: (body ? body.y : 0) + root.linkBox.y - 1
       width: root.linkBox.width + 6
       height: root.linkBox.height + 2
       radius: 3

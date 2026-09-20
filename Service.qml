@@ -20,6 +20,12 @@ Item {
   readonly property string helper: Qt.resolvedUrl("bin/omlibria").toString().replace("file://", "")
   readonly property string cacheRoot: home + "/.cache/omarchy/omlibria"
 
+  // The helper caps its own output. This is the backstop for a helper that has
+  // been replaced or has failed to: reading stops at the ceiling, before the
+  // response is buffered any further or handed to JSON.parse, so a crafted
+  // library cannot grow this long-lived shell process.
+  readonly property int maxResponseBytes: 16 * 1024 * 1024
+
   // ---- persisted state ----------------------------------------------------
   // library, lastKey, lastView, fontSize, serif, sort,
   // books: { <key>: { spine, pos, progress, ts } }
@@ -199,8 +205,21 @@ Item {
   Process {
     id: scanProc
     stdout: StdioCollector {
+      property bool overflowed: false
+      onDataChanged: {
+        if (!overflowed && data && data.byteLength > root.maxResponseBytes) {
+          overflowed = true
+          scanProc.running = false
+        }
+      }
       onStreamFinished: {
         root.scanning = false
+        if (overflowed) {
+          root.books = []
+          root.scanError = "This library returned more data than Omlibria will read"
+          overflowed = false
+          return
+        }
         try {
           var r = JSON.parse(text)
           root.books = r.books || []
@@ -215,8 +234,21 @@ Item {
   Process {
     id: prepProc
     stdout: StdioCollector {
+      property bool overflowed: false
+      onDataChanged: {
+        if (!overflowed && data && data.byteLength > root.maxResponseBytes) {
+          overflowed = true
+          prepProc.running = false
+        }
+      }
       onStreamFinished: {
         root.bookLoading = false
+        if (overflowed) {
+          root.book = null
+          root.bookError = "This book returned more data than Omlibria will read"
+          overflowed = false
+          return
+        }
         try {
           var r = JSON.parse(text)
           if (r.error) { root.bookError = r.error; root.book = null }
@@ -232,7 +264,15 @@ Item {
     id: libsProc
     command: ["python3", root.helper, "libraries"]
     stdout: StdioCollector {
+      property bool overflowed: false
+      onDataChanged: {
+        if (!overflowed && data && data.byteLength > root.maxResponseBytes) {
+          overflowed = true
+          libsProc.running = false
+        }
+      }
       onStreamFinished: {
+        if (overflowed) { root.foundLibraries = []; overflowed = false; return }
         try { root.foundLibraries = JSON.parse(text) } catch (e) { root.foundLibraries = [] }
       }
     }
