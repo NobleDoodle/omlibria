@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 
 // Full-panel cheat sheet. `rows` is a list of [keys, description] pairs; an
 // entry with an empty description renders as a section label.
@@ -11,7 +12,7 @@ Rectangle {
   property string footnote: ""
   signal dismissed()
 
-  color: Color.popups.background
+  color: Commons.Color.popups.background
   z: 10
 
   MouseArea { anchors.fill: parent; onClicked: root.dismissed() }
@@ -22,7 +23,7 @@ Rectangle {
 
     Text {
       text: root.heading
-      color: Color.popups.text
+      color: Commons.Color.popups.text
       font { family: Style.font.family; pixelSize: Style.font.body + 5; bold: true }
       bottomPadding: 8
     }
@@ -35,14 +36,14 @@ Rectangle {
         Text {
           width: 150
           text: modelData[0]
-          color: Color.accent
+          color: Commons.Color.accent
           elide: Text.ElideRight
           font { family: Style.font.family; pixelSize: Style.font.body - 1; bold: true }
         }
         Text {
           width: root.width - 48 - 150 - 14
           text: modelData[1]
-          color: Color.popups.text
+          color: Commons.Color.popups.text
           elide: Text.ElideRight
           font { family: Style.font.family; pixelSize: Style.font.body - 1 }
         }
@@ -54,7 +55,7 @@ Rectangle {
       text: root.footnote
       width: parent.width
       wrapMode: Text.Wrap
-      color: Color.muted
+      color: Commons.Color.muted
       font { family: Style.font.family; pixelSize: Style.font.body - 2 }
     }
   }

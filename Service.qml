@@ -4,6 +4,7 @@ import Quickshell.Io
 import Quickshell.Wayland
 import Quickshell.Hyprland
 import qs.Commons
+import qs.Commons as Commons
 
 // Headless owner of everything Omlibria does: library scan, reading
 // state, and the two surfaces (compact popup under the bar button / tiled
@@ -403,7 +404,7 @@ Item {
       id: win
       screen: root.targetScreen
       title: "Omlibria"
-      color: Color.popups.background
+      color: Commons.Color.popups.background
       implicitWidth: 900
       implicitHeight: 900
       minimumSize: Qt.size(420, 360)

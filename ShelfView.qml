@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 
 // Cover list of the selected Calibre library.
 FocusScope {
@@ -9,9 +10,9 @@ FocusScope {
   property bool popup: true
   readonly property bool compact: popup
 
-  readonly property color fg: Color.popups.text
-  readonly property color dim: Color.muted
-  readonly property color accent: Color.accent
+  readonly property color fg: Commons.Color.popups.text
+  readonly property color dim: Commons.Color.muted
+  readonly property color accent: Commons.Color.accent
   readonly property string fontFamily: Style.font.family
   readonly property int fs: Style.font.body
 
@@ -193,7 +194,7 @@ FocusScope {
         verticalAlignment: TextInput.AlignVCenter
         color: root.fg
         selectionColor: root.accent
-        selectedTextColor: Color.popups.background
+        selectedTextColor: Commons.Color.popups.background
         font { family: root.fontFamily; pixelSize: root.fs }
         clip: true
         onTextChanged: root.query = text
@@ -257,7 +258,7 @@ FocusScope {
       Rectangle {
         anchors { fill: parent; leftMargin: 10; rightMargin: 10 }
         radius: Style.cornerRadius
-        color: row.current ? Color.menu.selectedBackground
+        color: row.current ? Commons.Color.menu.selectedBackground
           : rowArea.containsMouse ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.05) : "transparent"
         border.width: row.current ? 1 : 0
         border.color: root.accent
@@ -300,7 +301,7 @@ FocusScope {
           text: row.modelData.title
           textFormat: Text.PlainText
           elide: Text.ElideRight
-          color: row.current ? Color.menu.selectedText : root.fg
+          color: row.current ? Commons.Color.menu.selectedText : root.fg
           font { family: root.fontFamily; pixelSize: root.fs + 1; bold: true }
         }
         Text {
@@ -392,7 +393,7 @@ FocusScope {
     id: picker
     anchors.fill: parent
     visible: root.picking
-    color: Color.popups.background
+    color: Commons.Color.popups.background
     z: 5
 
     function apply(path) {
@@ -437,7 +438,7 @@ FocusScope {
           verticalAlignment: TextInput.AlignVCenter
           color: root.fg
           selectionColor: root.accent
-          selectedTextColor: Color.popups.background
+          selectedTextColor: Commons.Color.popups.background
           font { family: root.fontFamily; pixelSize: root.fs }
           clip: true
           Keys.onPressed: function(e) {
@@ -480,7 +481,7 @@ FocusScope {
           width: found.width
           height: 34
           radius: Style.cornerRadius
-          color: ListView.isCurrentItem && found.activeFocus ? Color.menu.selectedBackground : "transparent"
+          color: ListView.isCurrentItem && found.activeFocus ? Commons.Color.menu.selectedBackground : "transparent"
           Text {
             anchors { fill: parent; leftMargin: 10; rightMargin: 10 }
             verticalAlignment: Text.AlignVCenter
@@ -557,15 +558,15 @@ FocusScope {
       width: tipText.implicitWidth + 16
       height: tipText.implicitHeight + 10
       radius: Style.cornerRadius
-      color: Color.tooltip.background
+      color: Commons.Color.tooltip.background
       border.width: 1
-      border.color: Color.tooltip.border
+      border.color: Commons.Color.tooltip.border
       Text {
         id: tipText
         anchors.centerIn: parent
         text: btn.tip
         textFormat: Text.PlainText
-        color: Color.tooltip.text
+        color: Commons.Color.tooltip.text
         font { family: root.fontFamily; pixelSize: root.fs - 2 }
       }
     }

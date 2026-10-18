@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 
 // Paginated EPUB reader. Pages break on whole-line boundaries and turn with a
 // short side-to-side slide. The reading position is stored as (spine index,
@@ -13,9 +14,9 @@ FocusScope {
   property var svc: null
   property bool popup: true
 
-  readonly property color fg: Color.popups.text
-  readonly property color dim: Color.muted
-  readonly property color accent: Color.accent
+  readonly property color fg: Commons.Color.popups.text
+  readonly property color dim: Commons.Color.muted
+  readonly property color accent: Commons.Color.accent
   readonly property string uiFont: Style.font.family
   readonly property string bodyFont: svc && svc.serif ? "serif" : Style.font.family
   readonly property int uiSize: Style.font.body
@@ -685,7 +686,7 @@ FocusScope {
     y: flick.y
     width: flick.width
     height: root.padTop
-    color: Color.popups.background
+    color: Commons.Color.popups.background
   }
 
   Rectangle {
@@ -693,7 +694,7 @@ FocusScope {
     y: flick.y + root.pageBottom
     width: flick.width
     height: Math.max(0, flick.height - root.pageBottom)
-    color: Color.popups.background
+    color: Commons.Color.popups.background
   }
 
   // Input layer. Kept outside the Flickable so coordinates are plain viewport
@@ -764,7 +765,7 @@ FocusScope {
   Rectangle {
     anchors { top: header.bottom; left: parent.left; right: parent.right; bottom: parent.bottom }
     visible: root.showToc
-    color: Color.popups.background
+    color: Commons.Color.popups.background
     z: 5
 
     ListView {
@@ -806,7 +807,7 @@ FocusScope {
         width: tocList.width
         height: 34
         radius: Style.cornerRadius
-        color: ListView.isCurrentItem ? Color.menu.selectedBackground : "transparent"
+        color: ListView.isCurrentItem ? Commons.Color.menu.selectedBackground : "transparent"
         Text {
           anchors { fill: parent; leftMargin: 12; rightMargin: 12 }
           verticalAlignment: Text.AlignVCenter

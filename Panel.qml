@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 
 // The surface content shared by the compact popup and the tiled window.
 Item {
@@ -17,9 +18,9 @@ Item {
   Rectangle {
     anchors.fill: parent
     radius: root.popup ? Style.cornerRadius : 0
-    color: Color.popups.background
+    color: Commons.Color.popups.background
     border.width: root.popup ? 2 : 0
-    border.color: Color.popups.border
+    border.color: Commons.Color.popups.border
   }
 
   ShelfView {
