@@ -137,6 +137,10 @@ you install. For Omlibria:
 - **Books are treated as hostile.** A book's file paths cannot reach outside the
   book, zip and XML bombs are capped, titles and authors are shown as plain
   text, and Calibre's `metadata.db` paths cannot climb out of the library.
+- **Images are stripped before they are shown.** A book's PNG, JPEG and GIF
+  images are copied into the cache with every metadata chunk removed, so no
+  attacker-chosen metadata reaches the renderer's decoders; other formats are
+  refused rather than handed to a decoder of their own.
 - The helper is `python3` run with argument lists, never through a shell.
 - It registers no Hyprland keybindings and never calls `hyprctl`.
 

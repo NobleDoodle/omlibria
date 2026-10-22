@@ -34,6 +34,22 @@ MAX_XML_BYTES = 16 * 1024 * 1024
 MAX_CHAPTER_BYTES = 8 * 1024 * 1024
 MAX_SPINE = 20000
 
+# A book's images are handed to the reader's rich-text renderer, which decodes
+# them inside the long-lived shell process. A file's own size bounds nothing
+# there: a PNG can carry compressed text chunks that expand to far more than
+# the file, and its header can claim dimensions no one wants decoded. Images
+# are therefore stripped of metadata and bounded before the reader sees them.
+MAX_IMAGE_BYTES = 32 * 1024 * 1024    # one image file inside a book
+MAX_IMAGE_PIXELS = 24000000           # width x height the renderer will decode
+                                      # (the largest image in a real library here is 3.3 MP)
+MAX_IMAGE_PARTS = 512                 # chunks or segments before a file is refused
+
+# PNG chunks worth keeping: the ones carrying pixels, and fixed-size rendering
+# hints. tEXt, zTXt, iTXt, iCCP, eXIf and anything unrecognized are dropped, so
+# no attacker-chosen metadata reaches libpng at all.
+PNG_KEEP = frozenset((b"IHDR", b"PLTE", b"tRNS", b"IDAT", b"IEND",
+                      b"gAMA", b"cHRM", b"sRGB", b"sBIT", b"pHYs"))
+
 # A Calibre library is chosen by the user but its metadata.db may have been
 # downloaded or shared, so its size, row counts and text lengths are all
 # attacker-chosen. Every one of them is bounded before it reaches memory, and
@@ -498,36 +514,122 @@ def prepare(library, rel, cache_root):
 # chapter -> Qt rich text
 # --------------------------------------------------------------------------
 
-def image_size(path):
+def sanitized_png(data):
+    """PNG bytes with every ancillary metadata chunk removed, and its size.
+
+    Walking the chunk list and copying only the ones above is what contains the
+    expansion: libpng is never handed a compressed text or profile chunk, so
+    there is no ratio to get wrong.
+    """
+    parts, dims, pos, count, ended = [data[:8]], None, 8, 0, False
+    while pos + 12 <= len(data):
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        ctype = data[pos + 4:pos + 8]
+        end = pos + 12 + length
+        if length > MAX_IMAGE_BYTES or end > len(data):
+            return None, None
+        count += 1
+        if count > MAX_IMAGE_PARTS:
+            return None, None
+        if ctype == b"IHDR":
+            if length < 13:
+                return None, None
+            dims = struct.unpack(">II", data[pos + 8:pos + 16])
+        if ctype in PNG_KEEP:
+            parts.append(data[pos:end])
+        pos = end
+        if ctype == b"IEND":
+            ended = True
+            break
+    if not dims or not ended:
+        return None, None
+    return b"".join(parts), dims
+
+
+def sanitized_jpeg(data):
+    """JPEG bytes with every APPn and comment segment removed, and its size."""
+    parts, dims, pos, count = [data[:2]], None, 2, 0
+    while pos + 4 <= len(data):
+        if data[pos] != 0xFF:
+            return None, None
+        marker = data[pos + 1]
+        if marker == 0x01 or 0xD0 <= marker <= 0xD9:
+            parts.append(data[pos:pos + 2])     # standalone marker, no payload
+            pos += 2
+            continue
+        length = struct.unpack(">H", data[pos + 2:pos + 4])[0]
+        end = pos + 2 + length
+        if length < 2 or end > len(data):
+            return None, None
+        count += 1
+        if count > MAX_IMAGE_PARTS:
+            return None, None
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            if length < 7:
+                return None, None
+            height, width = struct.unpack(">HH", data[pos + 5:pos + 9])
+            dims = (width, height)
+        # APPn carries EXIF, ICC and XMP; COM is a free-text comment.
+        if not (0xE0 <= marker <= 0xEF or marker == 0xFE):
+            parts.append(data[pos:end])
+        pos = end
+        if marker == 0xDA:                      # start of scan: entropy-coded data follows
+            parts.append(data[end:])
+            break
+    if not dims:
+        return None, None
+    return b"".join(parts), dims
+
+
+def safe_image(path, root):
+    """Path to a metadata-free copy of `path`, cached beside the book.
+
+    Only PNG, JPEG and GIF are accepted, by magic bytes rather than by file
+    name. Anything else -- SVG, TIFF, WebP, PDF -- would hand a different Qt
+    decoder a parser of its own inside the shell, so it is refused rather than
+    sanitized.
+    """
     try:
+        size = os.path.getsize(path)
+        if size > MAX_IMAGE_BYTES:
+            return None, None
         with open(path, "rb") as f:
-            head = f.read(32)
-            if head[:8] == b"\x89PNG\r\n\x1a\n":
-                return struct.unpack(">II", head[16:24])
-            if head[:6] in (b"GIF87a", b"GIF89a"):
-                return struct.unpack("<HH", head[6:10])
-            if head[:2] == b"\xff\xd8":
-                f.seek(2)
-                for _ in range(1024):
-                    b = f.read(1)
-                    while b and b != b"\xff":
-                        b = f.read(1)
-                    while b == b"\xff":
-                        b = f.read(1)
-                    if not b:
-                        return None
-                    marker = b[0]
-                    if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
-                        f.read(3)
-                        h, w = struct.unpack(">HH", f.read(4))
-                        return w, h
-                    seg = struct.unpack(">H", f.read(2))[0]
-                    if seg < 2:
-                        return None      # a crafted length would seek backwards for ever
-                    f.seek(seg - 2, 1)
-    except Exception:
-        return None
-    return None
+            data = f.read(MAX_IMAGE_BYTES + 1)
+    except OSError:
+        return None, None
+    if len(data) > MAX_IMAGE_BYTES or len(data) < 16:
+        return None, None
+
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        clean, dims, suffix = sanitized_png(data) + ("png",)
+    elif data[:2] == b"\xff\xd8":
+        clean, dims, suffix = sanitized_jpeg(data) + ("jpg",)
+    elif data[:6] in (b"GIF87a", b"GIF89a"):
+        # GIF has no compressed-metadata path; its extension blocks are plain
+        # bytes, so the size and pixel bounds below are enough.
+        clean, dims, suffix = data, struct.unpack("<HH", data[6:10]), "gif"
+    else:
+        return None, None
+
+    if not clean or not dims:
+        return None, None
+    width, height = dims
+    if not width or not height or width * height > MAX_IMAGE_PIXELS:
+        return None, None
+
+    name = hashlib.sha1(("%s|%d|%d" % (path, size, len(clean))).encode()).hexdigest()[:16]
+    folder = os.path.join(root, ".omlibria-images")
+    dest = os.path.join(folder, "%s.%s" % (name, suffix))
+    if not os.path.isfile(dest):
+        try:
+            os.makedirs(folder, mode=0o700, exist_ok=True)
+            partial = dest + ".part"
+            with open(partial, "wb") as f:
+                f.write(clean)
+            os.replace(partial, dest)
+        except OSError:
+            return None, None
+    return dest, dims
 
 
 def parse_css(text, rules):
@@ -732,7 +834,9 @@ class Converter(HTMLParser):
         path = contained(os.path.join(self.base, urllib.parse.unquote(src.split("#")[0])), self.root)
         if not path or not os.path.isfile(path):
             return             # image source outside the book, or missing
-        size = image_size(path)
+        path, size = safe_image(path, self.root)
+        if not path:
+            return             # unsupported format, oversized, or malformed
         attrs = ""
         # A standalone image goes in its own block. That block is a div rather
         # than a paragraph so the reader's paragraph line-height does not apply

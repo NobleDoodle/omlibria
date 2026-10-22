@@ -14,10 +14,12 @@ import io
 import json
 import os
 import sqlite3
+import struct
 import sys
 import tempfile
 import unittest
 import zipfile
+import zlib
 
 HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bin", "omlibria")
 loader = importlib.machinery.SourceFileLoader("omlibria", HELPER)
@@ -264,6 +266,99 @@ class HelperSecurity(unittest.TestCase):
         book = self.prepare()
         self.assertEqual(book["error"], "")
         self.assertEqual(len(book["spine"]), 1)
+
+    # ---- images handed to the renderer -------------------------------------
+
+    def png(self, chunks=(), width=1, height=1):
+        """A valid 1x1 PNG, optionally carrying extra chunks."""
+        def chunk(kind, payload):
+            return (struct.pack(">I", len(payload)) + kind + payload
+                    + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF))
+        ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+        body = b"".join(chunk(k, v) for k, v in chunks)
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + body
+                + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00"))
+                + chunk(b"IEND", b""))
+
+    def write_image(self, name, data):
+        path = os.path.join(self.library, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        open(os.path.join(self.library, ".extracted"), "w").close()
+        return path
+
+    def test_png_text_bomb_never_reaches_the_renderer(self):
+        bomb = zlib.compress(b"A" * (20 * 1024 * 1024))
+        data = self.png(chunks=[(b"zTXt", b"Comment\x00\x00" + bomb)])
+        self.assertIn(b"zTXt", data)
+        self.assertLess(len(data), 64 * 1024, "the bomb is small on disk")
+        path = self.write_image("bomb.png", data)
+        clean, dims = omlibria.safe_image(path, self.library)
+        self.assertTrue(clean)
+        with open(clean, "rb") as f:
+            out = f.read()
+        self.assertNotIn(b"zTXt", out)
+        self.assertLess(len(out), 1024, "nothing is left to expand")
+        self.assertEqual(dims, (1, 1))
+
+    def test_other_metadata_chunks_are_dropped(self):
+        data = self.png(chunks=[(b"tEXt", b"K\x00v"), (b"iTXt", b"K\x00\x00\x00\x00\x00v"),
+                                (b"iCCP", b"P\x00\x00" + zlib.compress(b"C" * 4096)),
+                                (b"eXIf", b"E" * 64)])
+        path = self.write_image("meta.png", data)
+        clean, _ = omlibria.safe_image(path, self.library)
+        with open(clean, "rb") as f:
+            out = f.read()
+        for kind in (b"tEXt", b"iTXt", b"iCCP", b"eXIf"):
+            self.assertNotIn(kind, out)
+        self.assertIn(b"IDAT", out, "the pixels survive")
+
+    def test_png_claiming_huge_dimensions_is_refused(self):
+        data = self.png(width=40000, height=40000)      # 1.6e9 pixels to decode
+        path = self.write_image("huge.png", data)
+        self.assertEqual(omlibria.safe_image(path, self.library), (None, None))
+
+    def test_formats_with_their_own_decoder_are_refused(self):
+        for name, blob in (("x.svg", b"<svg xmlns='http://www.w3.org/2000/svg'><rect/></svg>" + b" " * 32),
+                           ("x.webp", b"RIFF\x00\x00\x00\x00WEBPVP8 " + b"\0" * 32),
+                           ("x.tif", b"II*\x00" + b"\0" * 64)):
+            path = self.write_image(name, blob)
+            self.assertEqual(omlibria.safe_image(path, self.library), (None, None), name)
+
+    def test_oversized_and_malformed_images_are_refused(self):
+        big = self.write_image("big.png", b"\x89PNG\r\n\x1a\n" + b"\0" * 4096)
+        omlibria.MAX_IMAGE_BYTES = 512
+        try:
+            self.assertEqual(omlibria.safe_image(big, self.library), (None, None))
+        finally:
+            omlibria.MAX_IMAGE_BYTES = 32 * 1024 * 1024
+        truncated = self.write_image("cut.png", self.png()[:-8])   # no IEND
+        self.assertEqual(omlibria.safe_image(truncated, self.library), (None, None))
+
+    def test_jpeg_application_segments_are_stripped(self):
+        payload = b"Exif\x00\x00" + b"E" * 60000
+        app1 = b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
+        # SOF0: length, precision, height, width, component count, one component
+        sof = (b"\xff\xc0" + struct.pack(">H", 11) + b"\x08" + struct.pack(">HH", 4, 4)
+               + b"\x01" + b"\x01\x11\x00")
+        data = b"\xff\xd8" + app1 + sof + b"\xff\xda" + struct.pack(">H", 2) + b"scan" + b"\xff\xd9"
+        path = self.write_image("meta.jpg", data)
+        clean, dims = omlibria.safe_image(path, self.library)
+        with open(clean, "rb") as f:
+            out = f.read()
+        self.assertEqual(dims, (4, 4))
+        self.assertNotIn(b"Exif", out)
+        self.assertLess(len(out), 128, "the 60 KB segment is gone")
+        self.assertIn(b"scan", out, "the image data survives")
+
+    def test_a_books_image_is_rendered_from_the_sanitized_copy(self):
+        html = '<html><body><p>t</p><p><img src="x.png"/></p></body></html>'
+        make_epub(self.epub, {"OEBPS/ok.xhtml": html,
+                              "OEBPS/x.png": self.png(chunks=[(b"tEXt", b"K\x00v")])})
+        book = self.prepare()
+        out = run(omlibria.chapter, book["spine"][0]["file"], 400, 477, "")
+        self.assertIn(".omlibria-images/", out, "the reader is pointed at the sanitized copy")
+        self.assertNotIn("x.png", out, "never the book's own file")
 
 
 if __name__ == "__main__":
