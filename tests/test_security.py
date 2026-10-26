@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sqlite3
 import struct
 import sys
@@ -357,8 +358,41 @@ class HelperSecurity(unittest.TestCase):
                               "OEBPS/x.png": self.png(chunks=[(b"tEXt", b"K\x00v")])})
         book = self.prepare()
         out = run(omlibria.chapter, book["spine"][0]["file"], 400, 477, "")
-        self.assertIn(".omlibria-images/", out, "the reader is pointed at the sanitized copy")
+        self.assertIn(omlibria.IMAGE_DIR_SUFFIX + "/", out, "pointed at the sanitized copy")
         self.assertNotIn("x.png", out, "never the book's own file")
+        shown = re.search(r'src="file://([^"]+)"', out).group(1)
+        self.assertFalse(shown.startswith(book["dir"] + os.sep),
+                         "the sanitized copy must sit outside the extracted book")
+
+    def test_a_preseeded_cache_file_is_overwritten_not_served(self):
+        """The cache name is computable from a book, so its bytes are never trusted."""
+        good = self.png()
+        path = self.write_image("real.png", good)
+        clean, _ = omlibria.safe_image(path, self.library)      # learn the computed name
+        bomb = self.png(chunks=[(b"zTXt", b"C\x00\x00" + zlib.compress(b"A" * (8 * 1024 * 1024)))])
+        with open(clean, "wb") as f:                            # preseed it, as a crafted book would
+            f.write(bomb)
+        served, _ = omlibria.safe_image(path, self.library)
+        self.assertEqual(served, clean, "same name, so the poisoned file is the one in the way")
+        with open(served, "rb") as f:
+            out = f.read()
+        self.assertNotIn(b"zTXt", out, "the preseeded bomb must not be served")
+        self.assertLess(len(out), 1024)
+
+    def test_a_book_cannot_ship_files_under_this_readers_names(self):
+        make_epub(self.epub, {"OEBPS/ok.xhtml": "<p>x</p>",
+                              ".extracted": "pwned",
+                              ".omlibria-meta.json": '{"v": 3, "spine": []}',
+                              ".omlibria-images/evil.png": "bomb"})
+        book = self.prepare()
+        self.assertEqual(book["error"], "")
+        root = book["dir"]
+        self.assertFalse(os.path.exists(os.path.join(root, ".omlibria-images")),
+                         "a reserved directory from the book must not be extracted")
+        with open(os.path.join(root, ".extracted")) as f:
+            self.assertEqual(f.read(), "", "our own marker, not the book's")
+        with open(os.path.join(root, ".omlibria-meta.json")) as f:
+            self.assertIn("title", f.read(), "our own listing, not the book's")
 
 
 if __name__ == "__main__":

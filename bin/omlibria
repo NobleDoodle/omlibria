@@ -14,6 +14,7 @@ import json
 import os
 import posixpath
 import re
+import shutil
 import sqlite3
 import struct
 import sys
@@ -43,6 +44,14 @@ MAX_IMAGE_BYTES = 32 * 1024 * 1024    # one image file inside a book
 MAX_IMAGE_PIXELS = 24000000           # width x height the renderer will decode
                                       # (the largest image in a real library here is 3.3 MP)
 MAX_IMAGE_PARTS = 512                 # chunks or segments before a file is refused
+
+# Names this reader owns inside a book's extraction directory. A book is a zip
+# whose entry names it chooses, so without this it could ship a file that looks
+# like one of ours and have it believed.
+RESERVED_NAMES = (".extracted", ".omlibria")
+# Sanitized images are written beside the extracted book rather than inside it,
+# so nothing a book carries can land on one of their names in the first place.
+IMAGE_DIR_SUFFIX = ".images"
 
 # PNG chunks worth keeping: the ones carrying pixels, and fixed-size rendering
 # hints. tEXt, zTXt, iTXt, iCCP, eXIf and anything unrecognized are dropped, so
@@ -359,6 +368,9 @@ def prepare(library, rel, cache_root):
                 target = contained(os.path.join(dest, m.filename), dest)
                 if not target:
                     continue          # entry tries to escape the cache directory
+                if any(part.startswith(RESERVED_NAMES)
+                       for part in os.path.relpath(target, dest).split(os.sep)):
+                    continue          # entry claims a name this reader owns
                 os.makedirs(os.path.dirname(target), exist_ok=True)
                 # Copy with a cap on real bytes: a zip header can understate
                 # how much it expands to, so the declared size proves nothing.
@@ -376,6 +388,12 @@ def prepare(library, rel, cache_root):
                             raise ValueError("Book expands to more than this reader will extract")
                         dst.write(chunk)
         open(marker, "w").close()
+
+    # An earlier release kept sanitized images inside the extracted book, where
+    # the book's own entries could reach them. Clear that directory out.
+    legacy = os.path.join(dest, ".omlibria-images")
+    if os.path.isdir(legacy):
+        shutil.rmtree(legacy, ignore_errors=True)
 
     # The cache directory is keyed by the file's size and mtime, so a cached
     # listing can never be stale for a different book.
@@ -617,18 +635,21 @@ def safe_image(path, root):
     if not width or not height or width * height > MAX_IMAGE_PIXELS:
         return None, None
 
+    # The sanitized bytes are always written, never reused from whatever happens
+    # to sit at this path: a book could otherwise ship a file at the name this
+    # computes and have it served untouched. Rewriting costs a few milliseconds
+    # a chapter, which is far less than converting the chapter itself.
     name = hashlib.sha1(("%s|%d|%d" % (path, size, len(clean))).encode()).hexdigest()[:16]
-    folder = os.path.join(root, ".omlibria-images")
+    folder = root.rstrip(os.sep) + IMAGE_DIR_SUFFIX
     dest = os.path.join(folder, "%s.%s" % (name, suffix))
-    if not os.path.isfile(dest):
-        try:
-            os.makedirs(folder, mode=0o700, exist_ok=True)
-            partial = dest + ".part"
-            with open(partial, "wb") as f:
-                f.write(clean)
-            os.replace(partial, dest)
-        except OSError:
-            return None, None
+    try:
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        partial = "%s.%d.part" % (dest, os.getpid())
+        with open(partial, "wb") as f:
+            f.write(clean)
+        os.replace(partial, dest)
+    except OSError:
+        return None, None
     return dest, dims
 
 
