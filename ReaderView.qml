@@ -552,6 +552,7 @@ FocusScope {
     case Qt.Key_0: svc.resetFont(); break
     case Qt.Key_F: svc.toggleSerif(); break
     case Qt.Key_E: svc.toggleExpanded(); break
+    case Qt.Key_Comma: svc.showSettings(); break
     case Qt.Key_Question: showHelp = true; break
     case Qt.Key_Backspace: if (!linkBack()) back(); break
     case Qt.Key_B: case Qt.Key_Escape: back(); break
@@ -843,6 +844,7 @@ FocusScope {
       ["u, Backspace", "back after following a link"],
       ["+ / − / 0", "font size"],
       ["f", "serif / sans"],
+      [",", "settings and about"],
       ["e", "menu ↔ tiled window"],
       ["Esc, b", "back to library"],
       ["q", "close (resumes here)"]

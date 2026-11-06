@@ -22,6 +22,12 @@ FocusScope {
   property bool showHelp: false
   readonly property var sortModes: ["recent", "title", "author", "added"]
 
+  // Both layouts show the same books and share one selection, so switching
+  // between them keeps the book you were on.
+  property int currentIndex: 0
+  readonly property bool gridded: svc && svc.libraryView === "grid"
+  readonly property int columns: gridView.columns
+
   readonly property var filtered: {
     var list = svc ? svc.books : []
     var words = query.toLowerCase().split(/\s+/).filter(function(w) { return w.length })
@@ -53,14 +59,20 @@ FocusScope {
   }
 
   function openCurrent() {
-    if (list.currentIndex >= 0 && list.currentIndex < filtered.length)
-      svc.openBook(filtered[list.currentIndex].key)
+    if (currentIndex >= 0 && currentIndex < filtered.length)
+      svc.openBook(filtered[currentIndex].key)
   }
 
-  function move(delta) {
+  function setIndex(i) {
     if (!filtered.length) return
-    list.currentIndex = Math.max(0, Math.min(filtered.length - 1, list.currentIndex + delta))
+    currentIndex = Math.max(0, Math.min(filtered.length - 1, i))
   }
+
+  function move(delta) { setIndex(currentIndex + delta) }
+
+  // Down and up mean the next row, which is one book in the list and a whole
+  // row of covers in the grid.
+  function moveRow(delta) { setIndex(currentIndex + delta * (gridded ? columns : 1)) }
 
   function cycleSort() {
     var i = sortModes.indexOf(svc.sort)
@@ -96,7 +108,12 @@ FocusScope {
   }
 
   onFilteredChanged: {
-    if (list.currentIndex >= filtered.length) list.currentIndex = Math.max(0, filtered.length - 1)
+    if (currentIndex >= filtered.length) currentIndex = Math.max(0, filtered.length - 1)
+  }
+
+  Connections {
+    target: root.svc
+    function onLibraryPickRequested() { Qt.callLater(root.startPicking) }
   }
 
   Keys.onPressed: function(e) {
@@ -105,19 +122,26 @@ FocusScope {
     if (picking) return
     if (showHelp) { showHelp = false; e.accepted = true; return }
     switch (e.key) {
-    case Qt.Key_Down: case Qt.Key_J: move(1); break
-    case Qt.Key_Up: case Qt.Key_K: move(-1); break
-    case Qt.Key_PageDown: move(6); break
-    case Qt.Key_PageUp: move(-6); break
-    case Qt.Key_D: if (ctrl) move(6); else return; break
-    case Qt.Key_U: if (ctrl) move(-6); else return; break
+    case Qt.Key_Down: case Qt.Key_J: moveRow(1); break
+    case Qt.Key_Up: case Qt.Key_K: moveRow(-1); break
+    case Qt.Key_PageDown: moveRow(gridded ? 3 : 6); break
+    case Qt.Key_PageUp: moveRow(gridded ? -3 : -6); break
+    case Qt.Key_D: if (ctrl) moveRow(gridded ? 3 : 6); else return; break
+    case Qt.Key_U: if (ctrl) moveRow(gridded ? -3 : -6); else return; break
     case Qt.Key_Home: case Qt.Key_G:
-      if (e.key === Qt.Key_G && shift) list.currentIndex = Math.max(0, filtered.length - 1)
-      else list.currentIndex = 0
+      if (e.key === Qt.Key_G && shift) setIndex(filtered.length - 1)
+      else setIndex(0)
       break
-    case Qt.Key_End: list.currentIndex = Math.max(0, filtered.length - 1); break
-    case Qt.Key_Return: case Qt.Key_Enter: case Qt.Key_Right: case Qt.Key_L: case Qt.Key_Space:
+    case Qt.Key_End: setIndex(filtered.length - 1); break
+    case Qt.Key_Left: case Qt.Key_H:
+      if (!gridded) return
+      move(-1); break
+    case Qt.Key_Right: case Qt.Key_L:
+      if (gridded) move(1); else openCurrent(); break
+    case Qt.Key_Return: case Qt.Key_Enter: case Qt.Key_Space:
       openCurrent(); break
+    case Qt.Key_V: svc.toggleLibraryView(); break
+    case Qt.Key_Comma: svc.showSettings(); break
     case Qt.Key_Slash: case Qt.Key_F:
       if (e.key === Qt.Key_F && !ctrl) return
       searching = true; searchField.forceActiveFocus(); break
@@ -164,8 +188,14 @@ FocusScope {
     Row {
       anchors { right: parent.right; rightMargin: 14; top: parent.top; topMargin: 10 }
       spacing: 4
+      IconButton {
+        glyph: root.gridded ? "▤" : "▦"
+        tip: root.gridded ? "Show as a list (v)" : "Show as a cover grid (v)"
+        onClicked: root.svc.toggleLibraryView()
+      }
       IconButton { glyph: "↻"; tip: "Rescan library folder (r)"; onClicked: root.svc.scan() }
       IconButton { glyph: "☰"; tip: "Choose library (o)"; onClicked: root.startPicking() }
+      IconButton { glyph: "⚙"; tip: "Settings (,)"; onClicked: root.svc.showSettings() }
       IconButton {
         glyph: root.popup ? "⤢" : "⤡"
         tip: root.popup ? "Open in tiled window (e)" : "Back to menu (e)"
@@ -235,129 +265,247 @@ FocusScope {
   }
 
   // ---- book list ----------------------------------------------------------
-  ListView {
-    id: list
+  Item {
+    id: shelfBody
     anchors { top: header.bottom; left: parent.left; right: parent.right; bottom: footer.top }
     clip: true
-    model: root.filtered
-    currentIndex: 0
-    boundsBehavior: Flickable.StopAtBounds
-    highlightMoveDuration: 0
-    keyNavigationEnabled: false
-    onCurrentIndexChanged: positionViewAtIndex(currentIndex, ListView.Contain)
-    spacing: 2
 
-    delegate: Item {
-      id: row
-      required property var modelData
-      required property int index
-      readonly property var prog: root.svc ? root.svc.progressFor(modelData.key) : null
-      readonly property bool current: ListView.isCurrentItem
-      readonly property bool last: root.svc && root.svc.st.lastKey === modelData.key
+    ListView {
+      id: list
+      anchors.fill: parent
+      visible: !root.gridded
+      model: root.filtered
+      currentIndex: root.currentIndex
+      boundsBehavior: Flickable.StopAtBounds
+      highlightMoveDuration: 0
+      keyNavigationEnabled: false
+      onCurrentIndexChanged: positionViewAtIndex(currentIndex, ListView.Contain)
+      spacing: 2
 
-      width: list.width
-      height: root.compact ? 70 : 92
+      delegate: Item {
+        id: row
+        required property var modelData
+        required property int index
+        readonly property var prog: root.svc ? root.svc.progressFor(modelData.key) : null
+        readonly property bool current: root.currentIndex === index
+        readonly property bool last: root.svc && root.svc.st.lastKey === modelData.key
 
-      Rectangle {
-        anchors { fill: parent; leftMargin: 10; rightMargin: 10 }
-        radius: Style.cornerRadius
-        color: row.current ? Commons.Color.menu.selectedBackground
-          : rowArea.containsMouse ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.05) : "transparent"
-        border.width: row.current ? 1 : 0
-        border.color: root.accent
-      }
+        width: list.width
+        height: root.compact ? 70 : 92
 
-      Rectangle {
-        id: coverBox
-        x: 20; anchors.verticalCenter: parent.verticalCenter
-        width: root.compact ? 40 : 48; height: root.compact ? 60 : 72
-        color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.08)
-        radius: 2
-        clip: true
-        Image {
-          anchors.fill: parent
-          source: row.modelData.cover ? "file://" + row.modelData.cover : ""
-          sourceSize: Qt.size(96, 144)
-          fillMode: Image.PreserveAspectCrop
-          asynchronous: true
-          cache: true
+        Rectangle {
+          anchors { fill: parent; leftMargin: 10; rightMargin: 10 }
+          radius: Style.cornerRadius
+          color: row.current ? Commons.Color.menu.selectedBackground
+            : rowArea.containsMouse ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.05) : "transparent"
+          border.width: row.current ? 1 : 0
+          border.color: root.accent
         }
-        Text {
-          anchors.centerIn: parent
-          visible: !row.modelData.cover
-          text: row.modelData.title.charAt(0)
-          textFormat: Text.PlainText
-          color: root.dim
-          font { family: root.fontFamily; pixelSize: 24; bold: true }
-        }
-      }
 
-      Column {
-        anchors {
-          left: coverBox.right; leftMargin: 14
-          right: parent.right; rightMargin: 24
-          verticalCenter: parent.verticalCenter
-        }
-        spacing: 3
-        Text {
-          width: parent.width
-          text: row.modelData.title
-          textFormat: Text.PlainText
-          elide: Text.ElideRight
-          color: row.current ? Commons.Color.menu.selectedText : root.fg
-          font { family: root.fontFamily; pixelSize: root.fs + 1; bold: true }
-        }
-        Text {
-          width: parent.width
-          text: row.modelData.authors
-          textFormat: Text.PlainText
-          elide: Text.ElideRight
-          color: root.dim
-          font { family: root.fontFamily; pixelSize: root.fs - 1 }
-        }
-        Text {
-          width: parent.width
-          visible: row.modelData.series !== "" && !root.compact
-          text: row.modelData.series + (row.modelData.seriesIndex ? " #" + row.modelData.seriesIndex : "")
-          textFormat: Text.PlainText
-          elide: Text.ElideRight
-          color: root.dim
-          font { family: root.fontFamily; pixelSize: root.fs - 3; italic: true }
-        }
-        Item {
-          width: parent.width
-          height: 14
-          Rectangle {
-            id: track
-            visible: row.prog !== null
-            anchors { left: parent.left; right: pct.left; rightMargin: 8; verticalCenter: parent.verticalCenter }
-            height: 3
-            radius: 1.5
-            color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.15)
-            Rectangle {
-              width: parent.width * Math.max(0, Math.min(1, row.prog ? row.prog.progress : 0))
-              height: parent.height
-              radius: parent.radius
-              color: root.accent
-            }
+        Rectangle {
+          id: coverBox
+          x: 20; anchors.verticalCenter: parent.verticalCenter
+          width: root.compact ? 40 : 48; height: root.compact ? 60 : 72
+          color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.08)
+          radius: 2
+          clip: true
+          Image {
+            anchors.fill: parent
+            source: row.modelData.cover ? "file://" + row.modelData.cover : ""
+            sourceSize: Qt.size(96, 144)
+            fillMode: Image.PreserveAspectCrop
+            asynchronous: true
+            cache: true
           }
           Text {
+            anchors.centerIn: parent
+            visible: !row.modelData.cover
+            text: row.modelData.title.charAt(0)
             textFormat: Text.PlainText
-            id: pct
-            anchors { right: parent.right; verticalCenter: parent.verticalCenter }
-            visible: row.prog !== null
-            text: (row.last ? "Continue · " : "") + Math.round((row.prog ? row.prog.progress : 0) * 100) + "%"
-            color: row.last ? root.accent : root.dim
-            font { family: root.fontFamily; pixelSize: root.fs - 3 }
+            color: root.dim
+            font { family: root.fontFamily; pixelSize: 24; bold: true }
           }
         }
-      }
 
-      MouseArea {
-        id: rowArea
-        anchors.fill: parent
-        hoverEnabled: true
-        onClicked: { list.currentIndex = row.index; root.openCurrent() }
+        Column {
+          anchors {
+            left: coverBox.right; leftMargin: 14
+            right: parent.right; rightMargin: 24
+            verticalCenter: parent.verticalCenter
+          }
+          spacing: 3
+          Text {
+            width: parent.width
+            text: row.modelData.title
+            textFormat: Text.PlainText
+            elide: Text.ElideRight
+            color: row.current ? Commons.Color.menu.selectedText : root.fg
+            font { family: root.fontFamily; pixelSize: root.fs + 1; bold: true }
+          }
+          Text {
+            width: parent.width
+            text: row.modelData.authors
+            textFormat: Text.PlainText
+            elide: Text.ElideRight
+            color: root.dim
+            font { family: root.fontFamily; pixelSize: root.fs - 1 }
+          }
+          Text {
+            width: parent.width
+            visible: row.modelData.series !== "" && !root.compact
+            text: row.modelData.series + (row.modelData.seriesIndex ? " #" + row.modelData.seriesIndex : "")
+            textFormat: Text.PlainText
+            elide: Text.ElideRight
+            color: root.dim
+            font { family: root.fontFamily; pixelSize: root.fs - 3; italic: true }
+          }
+          Item {
+            width: parent.width
+            height: 14
+            Rectangle {
+              id: track
+              visible: row.prog !== null
+              anchors { left: parent.left; right: pct.left; rightMargin: 8; verticalCenter: parent.verticalCenter }
+              height: 3
+              radius: 1.5
+              color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.15)
+              Rectangle {
+                width: parent.width * Math.max(0, Math.min(1, row.prog ? row.prog.progress : 0))
+                height: parent.height
+                radius: parent.radius
+                color: root.accent
+              }
+            }
+            Text {
+              textFormat: Text.PlainText
+              id: pct
+              anchors { right: parent.right; verticalCenter: parent.verticalCenter }
+              visible: row.prog !== null
+              text: (row.last ? "Continue \u00b7 " : "") + Math.round((row.prog ? row.prog.progress : 0) * 100) + "%"
+              color: row.last ? root.accent : root.dim
+              font { family: root.fontFamily; pixelSize: root.fs - 3 }
+            }
+          }
+        }
+
+        MouseArea {
+          id: rowArea
+          anchors.fill: parent
+          hoverEnabled: true
+          onClicked: { root.currentIndex = row.index; root.openCurrent() }
+        }
+      }
+    }
+
+    // Cover grid. The cell is sized from the panel width so the covers stay
+    // the same shape at every panel size, and the title and author sit under
+    // each one on fixed lines so no cell is taller than its neighbors.
+    GridView {
+      id: gridView
+      anchors.fill: parent
+      anchors.leftMargin: 12
+      anchors.rightMargin: 12
+      visible: root.gridded
+      model: root.filtered
+      currentIndex: root.currentIndex
+      boundsBehavior: Flickable.StopAtBounds
+      highlightMoveDuration: 0
+      keyNavigationEnabled: false
+      onCurrentIndexChanged: positionViewAtIndex(currentIndex, GridView.Contain)
+
+      readonly property int minCell: root.compact ? 104 : 128
+      readonly property int columns: Math.max(2, Math.floor(width / minCell))
+      cellWidth: width > 0 ? Math.floor(width / columns) : minCell
+      cellHeight: Math.round((cellWidth - 12) * 1.5) + 2 * root.fs + 22
+
+      delegate: Item {
+        id: cell
+        required property var modelData
+        required property int index
+        readonly property var prog: root.svc ? root.svc.progressFor(modelData.key) : null
+        readonly property bool current: root.currentIndex === index
+        readonly property bool last: root.svc && root.svc.st.lastKey === modelData.key
+
+        width: gridView.cellWidth
+        height: gridView.cellHeight
+
+        Rectangle {
+          anchors { fill: parent; margins: 2 }
+          radius: Style.cornerRadius
+          color: cell.current ? Commons.Color.menu.selectedBackground
+            : cellArea.containsMouse ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.05) : "transparent"
+          border.width: cell.current ? 1 : 0
+          border.color: root.accent
+        }
+
+        Column {
+          anchors { fill: parent; margins: 6 }
+          spacing: 4
+
+          Rectangle {
+            id: art
+            width: parent.width
+            height: Math.round(width * 1.5)
+            color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.08)
+            radius: 3
+            clip: true
+            Image {
+              anchors.fill: parent
+              source: cell.modelData.cover ? "file://" + cell.modelData.cover : ""
+              sourceSize: Qt.size(200, 300)
+              fillMode: Image.PreserveAspectCrop
+              asynchronous: true
+              cache: true
+            }
+            Text {
+              anchors.centerIn: parent
+              visible: !cell.modelData.cover
+              text: cell.modelData.title.charAt(0)
+              textFormat: Text.PlainText
+              color: root.dim
+              font { family: root.fontFamily; pixelSize: 28; bold: true }
+            }
+            // Progress sits on the cover itself, so a cell is the same height
+            // whether or not the book has been opened.
+            Rectangle {
+              visible: cell.prog !== null
+              anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+              height: 4
+              color: Qt.rgba(0, 0, 0, 0.45)
+              Rectangle {
+                width: parent.width * Math.max(0, Math.min(1, cell.prog ? cell.prog.progress : 0))
+                height: parent.height
+                color: cell.last ? root.accent : Qt.rgba(1, 1, 1, 0.75)
+              }
+            }
+          }
+
+          Text {
+            width: parent.width
+            height: root.fs + 4
+            text: cell.modelData.title
+            textFormat: Text.PlainText
+            elide: Text.ElideRight
+            color: cell.current ? Commons.Color.menu.selectedText : root.fg
+            font { family: root.fontFamily; pixelSize: root.fs - 2; bold: true }
+          }
+          Text {
+            width: parent.width
+            height: root.fs
+            text: cell.modelData.authors
+            textFormat: Text.PlainText
+            elide: Text.ElideRight
+            color: root.dim
+            font { family: root.fontFamily; pixelSize: root.fs - 4 }
+          }
+        }
+
+        MouseArea {
+          id: cellArea
+          anchors.fill: parent
+          hoverEnabled: true
+          onClicked: { root.currentIndex = cell.index; root.openCurrent() }
+        }
       }
     }
 
@@ -372,8 +520,8 @@ FocusScope {
       font { family: root.fontFamily; pixelSize: root.fs }
       text: !root.svc.library ? "Choose a Calibre library to begin"
         : root.svc.scanError ? root.svc.scanError
-        : root.svc.scanning ? "Scanning library…"
-        : root.query ? "No books match “" + root.query + "”"
+        : root.svc.scanning ? "Scanning library\u2026"
+        : root.query ? "No books match \u201c" + root.query + "\u201d"
         : "No EPUB books found in this library"
     }
   }
@@ -386,7 +534,7 @@ FocusScope {
     Text {
       textFormat: Text.PlainText
       anchors { left: parent.left; leftMargin: 20; verticalCenter: parent.verticalCenter }
-      text: "↵ read   / search   c continue   s sort   ? help"
+      text: "↵ read   / search   v view   , settings   ? help"
       color: root.dim
       elide: Text.ElideRight
       width: parent.width - 40
@@ -519,15 +667,31 @@ FocusScope {
     visible: root.showHelp
     heading: "Library"
     footnote: "Any key dismisses this."
-    rows: [
-      ["j / k, ↑ ↓", "move"],
+    rows: root.gridded ? [
+      ["h / l, ← →", "previous / next book"],
+      ["j / k, ↑ ↓", "up / down a row"],
       ["g / G", "first / last"],
-      ["Enter, l", "open book"],
+      ["Enter, Space", "open book"],
+      ["v", "back to the list"],
       ["c", "continue last book"],
       ["/", "search (Esc clears)"],
       ["s", "cycle sort"],
       ["r", "rescan library"],
       ["o", "choose library"],
+      [",", "settings and about"],
+      ["e", "menu ↔ tiled window"],
+      ["Esc, q", "close"]
+    ] : [
+      ["j / k, ↑ ↓", "move"],
+      ["g / G", "first / last"],
+      ["Enter, l", "open book"],
+      ["v", "cover grid"],
+      ["c", "continue last book"],
+      ["/", "search (Esc clears)"],
+      ["s", "cycle sort"],
+      ["r", "rescan library"],
+      ["o", "choose library"],
+      [",", "settings and about"],
       ["e", "menu ↔ tiled window"],
       ["Esc, q", "close"]
     ]
@@ -566,11 +730,16 @@ FocusScope {
     }
     Rectangle {
       visible: btn.tipShown
+      z: 20          // over the search field and the list it overhangs
       anchors { top: parent.bottom; topMargin: 6; right: parent.right }
       width: tipText.implicitWidth + 16
       height: tipText.implicitHeight + 10
       radius: Style.cornerRadius
-      color: Commons.Color.tooltip.background
+      // The theme's tooltip color can be translucent, which reads as smeared
+      // text over whatever the tip covers. Keep its hue, drop the alpha.
+      color: Qt.rgba(Commons.Color.tooltip.background.r,
+                     Commons.Color.tooltip.background.g,
+                     Commons.Color.tooltip.background.b, 1)
       border.width: 1
       border.color: Commons.Color.tooltip.border
       Text {

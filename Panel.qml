@@ -11,7 +11,8 @@ Item {
 
   function focusActive() {
     if (!svc) return
-    if (svc.view === "reader" && readerLoader.item) readerLoader.item.forceActiveFocus()
+    if (svc.view === "settings" && settingsLoader.item) settingsLoader.item.forceActiveFocus()
+    else if (svc.view === "reader" && readerLoader.item) readerLoader.item.forceActiveFocus()
     else shelf.forceActiveFocus()
   }
 
@@ -36,9 +37,25 @@ Item {
     id: readerLoader
     anchors.fill: parent
     anchors.margins: root.popup ? 2 : 0
-    active: root.svc && root.svc.view === "reader"
+    active: root.svc && (root.svc.view === "reader"
+                         || (root.svc.view === "settings" && root.svc.viewBefore === "reader"))
+    visible: root.svc && root.svc.view === "reader"
     onLoaded: item.forceActiveFocus()
     sourceComponent: ReaderView {
+      svc: root.svc
+      popup: root.popup
+    }
+  }
+
+  // Settings sits over whichever view opened it, so the reader keeps its
+  // chapter and scroll position while the panel is open.
+  Loader {
+    id: settingsLoader
+    anchors.fill: parent
+    anchors.margins: root.popup ? 2 : 0
+    active: root.svc && root.svc.view === "settings"
+    onLoaded: item.forceActiveFocus()
+    sourceComponent: SettingsView {
       svc: root.svc
       popup: root.popup
     }

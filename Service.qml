@@ -38,9 +38,22 @@ Item {
   readonly property bool serif: st.serif !== false
   readonly property string sort: st.sort || "recent"
 
+  // How big the compact popup is, and how the library is laid out inside it.
+  // The tiled window takes its size from the window manager, so neither of
+  // these touches it.
+  readonly property var panelSizes: ({
+    small:  { w: 420, h: 600, label: "Small" },
+    medium: { w: 520, h: 760, label: "Medium" },
+    large:  { w: 640, h: 920, label: "Large" }
+  })
+  readonly property string panelSize: panelSizes[st.panelSize] ? st.panelSize : "small"
+  readonly property var panelMetrics: panelSizes[panelSize]
+  readonly property string libraryView: st.libraryView === "grid" ? "grid" : "list"
+
   // ---- runtime state ------------------------------------------------------
   property string mode: "closed"          // closed | menu | window
-  property string view: "shelf"           // shelf | reader
+  property string view: "shelf"           // shelf | reader | settings
+  property string viewBefore: "shelf"     // what settings returns to
   property var books: []
   property string scanError: ""
   property bool scanning: false
@@ -201,6 +214,30 @@ Item {
   function resetFont() { setState({ fontSize: 18 }) }
   function toggleSerif() { setState({ serif: !serif }) }
   function setSort(s) { setState({ sort: s }) }
+  function setPanelSize(s) { if (panelSizes[s]) setState({ panelSize: s }) }
+  function setLibraryView(v) { setState({ libraryView: v === "grid" ? "grid" : "list" }) }
+  function toggleLibraryView() { setLibraryView(libraryView === "grid" ? "list" : "grid") }
+
+  // Settings is a view of its own, like the reader, and returns to whichever
+  // view opened it. `lastView` is left alone so reopening still resumes a book.
+  function showSettings() {
+    if (view === "settings") { closeSettings(); return }
+    if (view === "reader" && reader) reader.saveNow()
+    viewBefore = view
+    view = "settings"
+  }
+
+  // The library folder picker lives in the shelf; settings asks for it.
+  signal libraryPickRequested()
+  function pickLibrary() {
+    view = "shelf"
+    libraryPickRequested()
+  }
+
+  function closeSettings() {
+    if (view !== "settings") return
+    view = viewBefore === "reader" && currentKey ? "reader" : "shelf"
+  }
 
   // ---- processes ----------------------------------------------------------
   Process {
@@ -350,7 +387,7 @@ Item {
 
       PanelWindow {
         id: menu
-        readonly property int cardWidth: 420
+        readonly property int cardWidth: root.panelMetrics.w
         readonly property int screenHeight: root.targetScreen ? root.targetScreen.height : 1080
         readonly property int screenWidth: root.targetScreen ? root.targetScreen.width : 1920
         readonly property bool atBottom: root.menuAnchor.pos === "bottom"
@@ -365,7 +402,8 @@ Item {
           bottom: root.menuAnchor.h + Style.gapsOut
         }
         implicitWidth: cardWidth
-        implicitHeight: Math.min(600, screenHeight - root.menuAnchor.h - 4 * Style.gapsOut)
+        implicitHeight: Math.min(root.panelMetrics.h,
+                                 screenHeight - root.menuAnchor.h - 4 * Style.gapsOut)
         exclusionMode: ExclusionMode.Ignore
         color: "transparent"
 
@@ -438,6 +476,7 @@ Item {
     function expand(): void { root.expand() }
     function collapse(): void { root.collapse() }
     function toggleExpanded(): void { root.toggleExpanded() }
+    function settings(): void { root.showSettings() }
     function next(): void { if (root.reader) root.reader.turnPage(1) }
     function prev(): void { if (root.reader) root.reader.turnPage(-1) }
     function library(path: string): void { root.setLibrary(path) }

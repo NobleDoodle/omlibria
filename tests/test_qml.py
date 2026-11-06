@@ -57,5 +57,30 @@ class TextFormat(unittest.TestCase):
                               % (os.path.basename(path), i + 1))
 
 
+class TooltipOpacity(unittest.TestCase):
+    """A theme's tooltip background can be translucent, which smears the text it
+    covers. Every tooltip rebuilds it at full alpha instead."""
+
+    def test_no_tooltip_uses_the_theme_color_directly(self):
+        for path in qml_files():
+            with open(path, encoding="utf-8") as f:
+                source = f.read()
+            bad = [line.strip() for line in source.splitlines()
+                   if re.search(r"color:\s*Commons\.Color\.tooltip\.background", line)]
+            self.assertEqual(bad, [], "%s fills a tooltip with the theme color as it comes; "
+                                      "wrap it in Qt.rgba(..., 1) so it stays opaque"
+                                      % os.path.basename(path))
+
+    def test_every_tooltip_is_opaque(self):
+        for path in qml_files():
+            with open(path, encoding="utf-8") as f:
+                source = f.read()
+            if "Color.tooltip.background" not in source:
+                continue
+            self.assertTrue("Commons.Color.tooltip.background.b, 1)" in source,
+                            "%s must build its tooltip fill at full alpha"
+                            % os.path.basename(path))
+
+
 if __name__ == "__main__":
     unittest.main()

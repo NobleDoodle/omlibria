@@ -14,6 +14,14 @@ Works with a Calibre Library folder for cover and title sync.
   and back to the popup again. Position carries over.
 - **Resume**: pressing the icon after closing reopens on the exact book and
   line you left, even after a font or size change.
+- **List or cover grid**: `v` (or the ▦ button) swaps the library between
+  the list of cards and a grid of covers. Your place in the library carries
+  over either way.
+- **Three panel sizes**: small, medium or large, in Settings. The tiled window
+  takes its size from your window manager, so this only sets the popup.
+- **Settings and About**: `,` (or the ⚙ button) opens panel size, library
+  layout, reading typeface and text size, and the library folder, with About
+  behind `?`.
 
 No Hyprland bindings are installed. Keys only act while the popup or window
 has focus.
@@ -66,13 +74,16 @@ Press `?` in either view for the cheat sheet.
 
 | Library | |
 |---|---|
-| `j` `k` / `↑` `↓` | move |
+| `j` `k` / `↑` `↓` | move (a whole row in the grid) |
+| `h` `l` / `←` `→` | previous / next cover, in the grid |
 | `g` `G` | first / last |
-| `Enter` `l` | open book |
+| `Enter` `Space` | open book (`l` opens it in the list too) |
+| `v` | list ↔ cover grid |
 | `c` | continue last book |
 | `/` | search (`Esc` clears) |
 | `s` | cycle sort: recent, title, author, added |
 | `r` / `o` | rescan / choose library |
+| `,` | settings and about |
 | `e` | menu ↔ tiled window |
 | `Esc` `q` | close |
 
@@ -88,9 +99,20 @@ Press `?` in either view for the cheat sheet.
 | `Enter` | follow the selected link |
 | `+` `−` `0` | font size |
 | `f` | serif / sans |
+| `,` | settings and about |
 | `e` | menu ↔ tiled window |
 | `Esc` `b` | back to library |
 | `q` | close (resumes here) |
+
+| Settings | |
+|---|---|
+| `1` `2` `3` | panel size: small, medium, large |
+| `v` | library list ↔ cover grid |
+| `f` | serif / sans |
+| `+` `−` `0` | text size |
+| `o` / `r` | change library folder / rescan |
+| `?` | about, and back |
+| `Esc` `,` | back to where you were |
 
 Pages break on whole lines and turn with a short side-to-side slide; the
 mouse wheel and clicking the left or right edge of the page turn pages too.
@@ -107,6 +129,7 @@ For your own bindings or scripts (nothing is bound for you):
 ```sh
 omarchy-shell omlibria toggle | open | close | shelf   # toggle/open drop from the top right
 omarchy-shell omlibria expand | collapse | toggleExpanded
+omarchy-shell omlibria settings           # settings, over the shelf or the reader
 omarchy-shell omlibria next | prev        # turn a page
 omarchy-shell omlibria library "/path/to/Calibre Library"
 ```
@@ -114,7 +137,7 @@ omarchy-shell omlibria library "/path/to/Calibre Library"
 ## Files
 
 - `~/.local/state/omarchy/settings/omlibria.json`: library, last book,
-  per-book position, font size.
+  per-book position, font size, panel size, library layout.
 - `~/.cache/omarchy/omlibria/`: extracted EPUBs, safe to delete.
 
 ## Limits
@@ -132,8 +155,10 @@ you install. For Omlibria:
 - **Reads** your Calibre library folder (the database is opened read-only) and
   the book you are reading. **Writes** only its own state file and its cache
   (see Files), and the cache is private to your user.
-- **No network access.** The one outside action is opening a web link with
-  `xdg-open`, only when you click it in a book, and only for `http` and `https`.
+- **No network access.** The only outside action is `xdg-open` on a web link:
+  one you click in a book (`http` and `https` only), or one of the three fixed
+  addresses in About — this repository, its issue form, and the author's
+  coffee page.
 - **Books are treated as hostile.** A book's file paths cannot reach outside the
   book, zip and XML bombs are capped, and Calibre's `metadata.db` paths cannot
   climb out of the library. What the reader works out about a book is cached
