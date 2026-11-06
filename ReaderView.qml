@@ -720,6 +720,7 @@ FocusScope {
   }
 
   Text {
+    textFormat: Text.PlainText
     anchors.centerIn: flick
     visible: !root.chapterReady || !root.book
     text: root.svc.bookError ? root.svc.bookError : (root.book ? "" : "Opening book…")
@@ -740,12 +741,14 @@ FocusScope {
       Rectangle { width: parent.width * root.progress; height: parent.height; color: root.accent }
     }
     Text {
+      textFormat: Text.PlainText
       anchors { left: parent.left; leftMargin: 20; verticalCenter: parent.verticalCenter; verticalCenterOffset: 1 }
       text: "Page " + root.pageNow
       color: root.dim
       font { family: root.uiFont; pixelSize: root.uiSize - 3 }
     }
     Text {
+      textFormat: Text.PlainText
       visible: root.linkStack.length > 0
       anchors.centerIn: parent
       text: "↩ back"
@@ -754,6 +757,7 @@ FocusScope {
       MouseArea { anchors.fill: parent; anchors.margins: -8; onClicked: root.linkBack() }
     }
     Text {
+      textFormat: Text.PlainText
       anchors { right: parent.right; rightMargin: 20; verticalCenter: parent.verticalCenter; verticalCenterOffset: 1 }
       text: Math.round(root.progress * 100) + "%"
       color: root.dim
@@ -856,6 +860,7 @@ FocusScope {
     radius: Style.cornerRadius
     color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, ma.containsMouse ? 0.12 : 0)
     Text {
+      textFormat: Text.PlainText
       anchors.centerIn: parent
       text: btn.glyph
       color: btn.active ? root.accent : root.fg

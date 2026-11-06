@@ -135,12 +135,17 @@ you install. For Omlibria:
 - **No network access.** The one outside action is opening a web link with
   `xdg-open`, only when you click it in a book, and only for `http` and `https`.
 - **Books are treated as hostile.** A book's file paths cannot reach outside the
-  book, zip and XML bombs are capped, titles and authors are shown as plain
-  text, and Calibre's `metadata.db` paths cannot climb out of the library.
+  book, zip and XML bombs are capped, and Calibre's `metadata.db` paths cannot
+  climb out of the library. What the reader works out about a book is cached
+  beside the extracted copy rather than inside it, and checked field by field
+  before it is believed.
 - **Images are stripped before they are shown.** A book's PNG, JPEG and GIF
   images are copied into the cache with every metadata chunk removed, so no
   attacker-chosen metadata reaches the renderer's decoders; other formats are
   refused rather than handed to a decoder of their own.
+- **Every label renders plain text.** A title, a library path or an error
+  message is never sniffed for markup, so nothing a book carries can make the
+  shell request a URL.
 - The helper is `python3` run with argument lists, never through a shell.
 - It registers no Hyprland keybindings and never calls `hyprctl`.
 
@@ -151,6 +156,7 @@ Found a problem? Please open an issue.
 ```bash
 omarchy plugin validate .        # check the manifest against the shell's rules
 python3 tests/test_security.py   # hostile-input tests for the helper
+python3 tests/test_qml.py        # source checks for the shell's QML
 ```
 
 ## License

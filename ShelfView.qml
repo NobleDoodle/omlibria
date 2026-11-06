@@ -153,6 +153,7 @@ FocusScope {
       font { family: root.fontFamily; pixelSize: root.compact ? root.fs + 2 : root.fs + 5; bold: true }
     }
     Text {
+      textFormat: Text.PlainText
       visible: !root.compact
       anchors { left: title.right; leftMargin: 10; baseline: title.baseline }
       text: root.svc ? (root.filtered.length + (root.query ? " of " + root.svc.books.length : "") + " books") : ""
@@ -182,6 +183,7 @@ FocusScope {
       border.color: root.accent
 
       Text {
+        textFormat: Text.PlainText
         anchors { left: parent.left; leftMargin: 10; verticalCenter: parent.verticalCenter }
         visible: !searchField.text && !root.searching
         text: "Press / to search"
@@ -221,6 +223,7 @@ FocusScope {
       radius: Style.cornerRadius
       color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, sortArea.containsMouse ? 0.12 : 0.06)
       Text {
+        textFormat: Text.PlainText
         id: sortText
         anchors.centerIn: parent
         text: "Sort: " + (root.svc ? root.svc.sort : "")
@@ -339,6 +342,7 @@ FocusScope {
             }
           }
           Text {
+            textFormat: Text.PlainText
             id: pct
             anchors { right: parent.right; verticalCenter: parent.verticalCenter }
             visible: row.prog !== null
@@ -358,6 +362,7 @@ FocusScope {
     }
 
     Text {
+      textFormat: Text.PlainText
       anchors.centerIn: parent
       width: parent.width - 60
       horizontalAlignment: Text.AlignHCenter
@@ -379,6 +384,7 @@ FocusScope {
     anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
     height: 30
     Text {
+      textFormat: Text.PlainText
       anchors { left: parent.left; leftMargin: 20; verticalCenter: parent.verticalCenter }
       text: "↵ read   / search   c continue   s sort   ? help"
       color: root.dim
@@ -413,11 +419,13 @@ FocusScope {
       spacing: 10
 
       Text {
+        textFormat: Text.PlainText
         text: "Calibre library"
         color: root.fg
         font { family: root.fontFamily; pixelSize: root.fs + 5; bold: true }
       }
       Text {
+        textFormat: Text.PlainText
         width: parent.width
         wrapMode: Text.Wrap
         text: "Pick a folder that contains metadata.db, or type a path."
@@ -454,6 +462,7 @@ FocusScope {
       }
 
       Text {
+        textFormat: Text.PlainText
         visible: found.count > 0
         text: "Detected"
         color: root.dim
@@ -483,6 +492,7 @@ FocusScope {
           radius: Style.cornerRadius
           color: ListView.isCurrentItem && found.activeFocus ? Commons.Color.menu.selectedBackground : "transparent"
           Text {
+            textFormat: Text.PlainText
             anchors { fill: parent; leftMargin: 10; rightMargin: 10 }
             verticalAlignment: Text.AlignVCenter
             elide: Text.ElideMiddle
@@ -495,6 +505,7 @@ FocusScope {
       }
 
       Text {
+        textFormat: Text.PlainText
         text: "Enter select   ↓ detected list   Esc cancel"
         color: root.dim
         font { family: root.fontFamily; pixelSize: root.fs - 3 }
@@ -533,6 +544,7 @@ FocusScope {
     radius: Style.cornerRadius
     color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, ma.containsMouse ? 0.12 : 0)
     Text {
+      textFormat: Text.PlainText
       anchors.centerIn: parent
       text: btn.glyph
       color: btn.active ? root.accent : root.fg

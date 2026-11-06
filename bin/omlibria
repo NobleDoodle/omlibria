@@ -52,6 +52,11 @@ RESERVED_NAMES = (".extracted", ".omlibria")
 # Sanitized images are written beside the extracted book rather than inside it,
 # so nothing a book carries can land on one of their names in the first place.
 IMAGE_DIR_SUFFIX = ".images"
+# The reading order this reader worked out is cached beside the extracted book
+# for the same reason, and carries a version so a listing written by an older
+# release is rebuilt instead of believed.
+META_SUFFIX = ".meta.json"
+META_VERSION = 4
 
 # PNG chunks worth keeping: the ones carrying pixels, and fixed-size rendering
 # hints. tEXt, zTXt, iTXt, iCCP, eXIf and anything unrecognized are dropped, so
@@ -341,14 +346,75 @@ def text_weight(path):
     return len(re.sub(r"\s+", " ", raw).strip()) + images * 600
 
 
+def book_key(rel, epub):
+    """The cache directory name for one book: its path, size and mtime."""
+    st = os.stat(epub)
+    stamp = "%s|%d|%d" % (rel, st.st_size, int(st.st_mtime))
+    return hashlib.sha1(stamp.encode()).hexdigest()[:16]
+
+
+def cached_meta(meta_path, dest):
+    """A previously computed reading order, rebuilt from scratch if in doubt.
+
+    Every field the reader goes on to use is checked and copied out by hand, so
+    a file that is the wrong version, truncated, the wrong shape, empty, or
+    carrying keys this reader never writes (an "error" string, say, which the
+    shell would display) is rebuilt rather than trusted.
+    """
+    try:
+        with open(meta_path) as f:
+            if os.fstat(f.fileno()).st_size > MAX_XML_BYTES:
+                return None
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(meta, dict) or meta.get("v") != META_VERSION:
+        return None
+    if meta.get("dir") != dest:
+        return None
+    spine_in = meta.get("spine")
+    toc_in = meta.get("toc")
+    if not isinstance(spine_in, list) or not isinstance(toc_in, list):
+        return None
+    if not spine_in or len(spine_in) > MAX_SPINE or len(toc_in) > MAX_SPINE * 2:
+        return None
+    spine = []
+    for item in spine_in:
+        if not isinstance(item, dict):
+            return None
+        path = item.get("file")
+        if not isinstance(path, str) or not contained(path, dest):
+            return None
+        title = item.get("title")
+        chars = item.get("chars")
+        if not isinstance(title, str) or not isinstance(chars, int) or isinstance(chars, bool):
+            return None
+        spine.append({"file": path, "title": title[:MAX_TEXT], "chars": max(0, chars)})
+    toc = []
+    for entry in toc_in:
+        if not isinstance(entry, dict):
+            return None
+        title = entry.get("title")
+        idx = entry.get("spine")
+        if not isinstance(title, str) or not isinstance(idx, int) or isinstance(idx, bool):
+            return None
+        if idx < 0 or idx >= len(spine):
+            return None
+        toc.append({"title": title[:MAX_TEXT], "spine": idx})
+    if not toc:
+        return None
+    title = meta.get("title")
+    return {"v": META_VERSION, "error": "", "dir": dest,
+            "title": title[:MAX_TEXT] if isinstance(title, str) else "",
+            "spine": spine, "toc": toc}
+
+
 def prepare(library, rel, cache_root):
     epub = within(library, rel)
     if not epub or not os.path.isfile(epub):
         out({"error": "That book is not inside the library"})
         return
-    st = os.stat(epub)
-    key = hashlib.sha1(("%s|%d|%d" % (rel, st.st_size, int(st.st_mtime))).encode()).hexdigest()[:16]
-    dest = os.path.join(cache_root, key)
+    dest = os.path.join(cache_root, book_key(rel, epub))
     marker = os.path.join(dest, ".extracted")
     if not os.path.isfile(marker):
         # Extracted books are the user's private files: keep them private.
@@ -389,23 +455,23 @@ def prepare(library, rel, cache_root):
                         dst.write(chunk)
         open(marker, "w").close()
 
-    # An earlier release kept sanitized images inside the extracted book, where
-    # the book's own entries could reach them. Clear that directory out.
-    legacy = os.path.join(dest, ".omlibria-images")
-    if os.path.isdir(legacy):
-        shutil.rmtree(legacy, ignore_errors=True)
+    # Earlier releases kept the sanitized images and the cached reading order
+    # inside the extracted book, where the book's own entries could reach them.
+    # Anything a pre-upgrade extraction left in those places is discarded: a
+    # book opened then may have supplied them itself.
+    shutil.rmtree(os.path.join(dest, ".omlibria-images"), ignore_errors=True)
+    try:
+        os.unlink(os.path.join(dest, ".omlibria-meta.json"))
+    except OSError:
+        pass
 
     # The cache directory is keyed by the file's size and mtime, so a cached
     # listing can never be stale for a different book.
-    meta_path = os.path.join(dest, ".omlibria-meta.json")
-    try:
-        with open(meta_path) as f:
-            meta = json.load(f)
-        if meta.get("v") == 3 and all(contained(i["file"], dest) for i in meta["spine"]):
-            out(meta)
-            return
-    except Exception:
-        pass
+    meta_path = dest.rstrip(os.sep) + META_SUFFIX
+    meta = cached_meta(meta_path, dest)
+    if meta:
+        out(meta)
+        return
 
     container = read_xml(os.path.join(dest, "META-INF", "container.xml"))
     opf_rel = None
@@ -519,10 +585,19 @@ def prepare(library, rel, cache_root):
     for item in spine:
         item["chars"] = text_weight(item["file"])
 
-    result = {"v": 3, "error": "", "dir": dest, "title": title, "spine": spine, "toc": toc}
+    # Cap the same strings the cached copy is capped at, so reopening a book
+    # gives the shell exactly what the first open did.
+    for entry in toc:
+        entry["title"] = entry["title"][:MAX_TEXT]
+    for item in spine:
+        item["title"] = item["title"][:MAX_TEXT]
+    result = {"v": META_VERSION, "error": "", "dir": dest,
+              "title": title[:MAX_TEXT], "spine": spine, "toc": toc}
     try:
-        with open(meta_path, "w") as f:
+        partial = "%s.%d.part" % (meta_path, os.getpid())
+        with open(partial, "w") as f:
             json.dump(result, f)
+        os.replace(partial, meta_path)
     except OSError:
         pass
     out(result)

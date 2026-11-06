@@ -22,6 +22,7 @@ Rectangle {
     spacing: 6
 
     Text {
+      textFormat: Text.PlainText
       text: root.heading
       color: Commons.Color.popups.text
       font { family: Style.font.family; pixelSize: Style.font.body + 5; bold: true }
@@ -34,6 +35,7 @@ Rectangle {
         required property var modelData
         spacing: 14
         Text {
+          textFormat: Text.PlainText
           width: 150
           text: modelData[0]
           color: Commons.Color.accent
@@ -41,6 +43,7 @@ Rectangle {
           font { family: Style.font.family; pixelSize: Style.font.body - 1; bold: true }
         }
         Text {
+          textFormat: Text.PlainText
           width: root.width - 48 - 150 - 14
           text: modelData[1]
           color: Commons.Color.popups.text
@@ -51,6 +54,7 @@ Rectangle {
     }
 
     Text {
+      textFormat: Text.PlainText
       topPadding: 10
       text: root.footnote
       width: parent.width

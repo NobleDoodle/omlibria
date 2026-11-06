@@ -33,5 +33,29 @@ class CommonsColorAlias(unittest.TestCase):
                                  f"{os.path.basename(path)} lacks the Commons alias")
 
 
+class TextFormat(unittest.TestCase):
+    """A label left on Text.AutoText sniffs its text for HTML, and an <img> in
+    it makes Qt fetch that URL. Book titles, helper errors and library paths all
+    reach labels, so every label states the format it renders."""
+
+    def test_every_label_declares_its_text_format(self):
+        for path in qml_files():
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().split("\n")
+            for i, line in enumerate(lines):
+                if not re.match(r"^\s*Text\s*\{\s*$", line):
+                    continue
+                depth, body = 0, []
+                for rest in lines[i:]:
+                    body.append(rest)
+                    depth += rest.count("{") - rest.count("}")
+                    if depth <= 0:
+                        break
+                self.assertIn("textFormat:", "\n".join(body),
+                              "%s:%d renders with Text.AutoText, which loads "
+                              "remote images out of the text it is given"
+                              % (os.path.basename(path), i + 1))
+
+
 if __name__ == "__main__":
     unittest.main()

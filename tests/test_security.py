@@ -391,8 +391,57 @@ class HelperSecurity(unittest.TestCase):
                          "a reserved directory from the book must not be extracted")
         with open(os.path.join(root, ".extracted")) as f:
             self.assertEqual(f.read(), "", "our own marker, not the book's")
-        with open(os.path.join(root, ".omlibria-meta.json")) as f:
-            self.assertIn("title", f.read(), "our own listing, not the book's")
+        self.assertFalse(os.path.exists(os.path.join(root, ".omlibria-meta.json")),
+                         "a reserved file from the book must not be extracted")
+
+    # ---- the cached reading order ------------------------------------------
+
+    def meta_path(self):
+        return self.prepare()["dir"].rstrip(os.sep) + omlibria.META_SUFFIX
+
+    def test_the_cached_listing_sits_outside_the_extracted_book(self):
+        make_epub(self.epub, {"OEBPS/ok.xhtml": "<p>x</p>"})
+        book = self.prepare()
+        meta = book["dir"].rstrip(os.sep) + omlibria.META_SUFFIX
+        self.assertTrue(os.path.isfile(meta), "the listing is cached beside the book")
+        self.assertFalse(meta.startswith(book["dir"] + os.sep),
+                         "nothing a book unpacks can reach the cached listing")
+
+    def test_a_legacy_in_book_listing_is_rebuilt_not_served(self):
+        """A book opened before the upgrade may have supplied its own listing."""
+        make_epub(self.epub, {"OEBPS/ok.xhtml": "<p>x</p>"})
+        dest = self.prepare()["dir"]                  # the extraction an older release left
+        os.unlink(dest.rstrip(os.sep) + omlibria.META_SUFFIX)
+        planted = os.path.join(dest, ".omlibria-meta.json")
+        with open(planted, "w") as f:
+            json.dump({"v": 3, "error": '<img src="http://book.example/ping.png">',
+                       "dir": dest, "title": "T", "spine": [], "toc": []}, f)
+        book = self.prepare()
+        self.assertEqual(book["error"], "", "the planted error must never be forwarded")
+        self.assertTrue(book["spine"], "the listing must be rebuilt from the book")
+        self.assertFalse(os.path.exists(planted), "the legacy file must be removed")
+
+    def test_a_tampered_cached_listing_is_rebuilt(self):
+        make_epub(self.epub, {"OEBPS/ok.xhtml": "<p>x</p>"})
+        meta = self.meta_path()
+        for bad in ({"v": 4, "error": "<img src=x>", "spine": [], "toc": []},
+                    {"v": 4, "dir": "/elsewhere", "spine": [{"file": "/etc/passwd",
+                     "title": "", "chars": 1}], "toc": [{"title": "a", "spine": 0}]},
+                    {"v": 99}, ["not", "a", "listing"]):
+            with open(meta, "w") as f:
+                json.dump(bad, f)
+            book = self.prepare()
+            self.assertEqual(book["error"], "", repr(bad))
+            self.assertTrue(book["spine"], repr(bad))
+            self.assertTrue(book["spine"][0]["file"].startswith(book["dir"] + os.sep),
+                            repr(bad))
+
+    def test_a_sound_cached_listing_is_reused(self):
+        make_epub(self.epub, {"OEBPS/ok.xhtml": "<p>x</p>"})
+        first = self.prepare()
+        os.unlink(os.path.join(first["dir"], "OEBPS", "content.opf"))
+        again = self.prepare()
+        self.assertEqual(again["spine"], first["spine"], "the cache is still used")
 
 
 if __name__ == "__main__":
