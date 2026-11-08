@@ -157,7 +157,7 @@ class HelperSecurity(unittest.TestCase):
 
     def test_database_path_climbing_out_of_the_library_is_not_listed(self):
         self.make_library("../outside")
-        listing = json.loads(run(omlibria.scan, self.library))
+        listing = json.loads(run(omlibria.scan, self.library, self.cache))
         self.assertEqual(listing["books"], [], "a ../ path in metadata.db must not be listed")
 
     def test_prepare_refuses_a_relative_path_that_climbs_out(self):
@@ -200,7 +200,7 @@ class HelperSecurity(unittest.TestCase):
         path = os.path.join(self.library, "metadata.db")
         with open(path, "ab") as f:                      # pad past the size policy
             f.write(b"\0" * (omlibria.MAX_DB_BYTES + 1 - os.path.getsize(path)))
-        result = json.loads(run(omlibria.scan, self.library))
+        result = json.loads(run(omlibria.scan, self.library, self.cache))
         self.assertIn("larger than", result["error"])
         self.assertEqual(result["books"], [])
 
@@ -209,7 +209,7 @@ class HelperSecurity(unittest.TestCase):
         self.build_db(books=5, authors_per_book=0, epub_rows=1)
         omlibria.MAX_BOOKS = 3
         try:
-            result = json.loads(run(omlibria.scan, self.library))
+            result = json.loads(run(omlibria.scan, self.library, self.cache))
         finally:
             omlibria.MAX_BOOKS = 20000
         self.assertIn("more books", result["error"])
@@ -219,7 +219,7 @@ class HelperSecurity(unittest.TestCase):
         self.build_db(books=3, authors_per_book=3)
         omlibria.MAX_LINK_ROWS = 4
         try:
-            result = json.loads(run(omlibria.scan, self.library))
+            result = json.loads(run(omlibria.scan, self.library, self.cache))
         finally:
             omlibria.MAX_LINK_ROWS = 200000
         self.assertIn("author entries", result["error"])
@@ -229,7 +229,7 @@ class HelperSecurity(unittest.TestCase):
         huge = "T" * (2 * 1024 * 1024)
         self.build_db(title=huge, author=huge)
         make_epub(os.path.join(self.library, "A", "B (1)", "b.epub"), {"OEBPS/ok.xhtml": "<p>x</p>"})
-        result = json.loads(run(omlibria.scan, self.library))
+        result = json.loads(run(omlibria.scan, self.library, self.cache))
         self.assertEqual(result["error"], "")
         book = result["books"][0]
         self.assertLessEqual(len(book["title"]), omlibria.MAX_TEXT)
@@ -238,7 +238,7 @@ class HelperSecurity(unittest.TestCase):
     def test_authors_per_book_are_capped(self):
         self.build_db(books=1, authors_per_book=50, author="A" * 50)
         make_epub(os.path.join(self.library, "A", "B (1)", "b.epub"), {"OEBPS/ok.xhtml": "<p>x</p>"})
-        result = json.loads(run(omlibria.scan, self.library))
+        result = json.loads(run(omlibria.scan, self.library, self.cache))
         self.assertEqual(result["error"], "")
         listed = result["books"][0]["authors"].split(", ")
         self.assertLessEqual(len(listed), omlibria.MAX_AUTHORS_PER_BOOK)
@@ -247,7 +247,7 @@ class HelperSecurity(unittest.TestCase):
         self.build_db(books=200, authors_per_book=2)
         omlibria.SCAN_SECONDS = 0.0                      # the deadline has already passed
         try:
-            result = json.loads(run(omlibria.scan, self.library))
+            result = json.loads(run(omlibria.scan, self.library, self.cache))
         finally:
             omlibria.SCAN_SECONDS = 20.0
         self.assertIn("too long", result["error"])
@@ -435,6 +435,108 @@ class HelperSecurity(unittest.TestCase):
             self.assertTrue(book["spine"], repr(bad))
             self.assertTrue(book["spine"][0]["file"].startswith(book["dir"] + os.sep),
                             repr(bad))
+
+    # ---- covers, which come from the library rather than a book -----------
+
+    def library_with_cover(self, data, folder="A/B (1)"):
+        """A metadata.db with one book, and `data` written as its cover file."""
+        self.build_db(path_value=folder)
+        make_epub(os.path.join(self.library, folder, "b.epub"),
+                  {"OEBPS/ok.xhtml": "<p>x</p>"})
+        db = sqlite3.connect(os.path.join(self.library, "metadata.db"))
+        db.execute("UPDATE books SET has_cover = 1")
+        db.commit()
+        db.close()
+        cover = os.path.join(self.library, folder, "cover.jpg")
+        with open(cover, "wb") as f:
+            f.write(data)
+        return cover
+
+    def listed_cover(self):
+        listing = json.loads(run(omlibria.scan, self.library, self.cache))
+        self.assertEqual(listing["error"], "")
+        self.assertEqual(len(listing["books"]), 1, listing)
+        return listing["books"][0]["cover"]
+
+    def test_a_cover_text_bomb_never_reaches_the_renderer(self):
+        """A crafted shared library can put a bomb at cover.jpg, so covers are
+        sanitized exactly as a book's own images are."""
+        bomb = zlib.compress(b"A" * (20 * 1024 * 1024))
+        data = self.png(chunks=[(b"zTXt", b"Comment\x00\x00" + bomb)])
+        source = self.library_with_cover(data)
+        served = self.listed_cover()
+        self.assertTrue(served, "a sound cover is still listed")
+        self.assertNotEqual(served, source, "never the library's own file")
+        with open(served, "rb") as f:
+            out = f.read()
+        self.assertNotIn(b"zTXt", out, "the bomb must not be served")
+        self.assertLess(len(out), 1024)
+
+    def test_a_sanitized_cover_sits_in_this_readers_cache(self):
+        source = self.library_with_cover(self.png())
+        served = self.listed_cover()
+        self.assertTrue(served.startswith(os.path.join(self.cache, omlibria.COVER_DIR) + os.sep),
+                        "covers are cached where only this reader writes")
+        self.assertFalse(served.startswith(self.library + os.sep),
+                         "nothing is served out of the library itself")
+        self.assertEqual(oct(os.stat(os.path.dirname(served)).st_mode & 0o777), "0o700")
+        self.assertTrue(os.path.isfile(source))
+
+    def test_a_cover_that_is_not_an_image_is_not_listed(self):
+        """A decoder this reader does not sanitize is never handed anything."""
+        for name, data in (("svg", b"<svg xmlns='http://www.w3.org/2000/svg'><rect/></svg>"),
+                           ("webp", b"RIFF\x24\x00\x00\x00WEBPVP8 "),
+                           ("empty", b""),
+                           ("truncated png", b"\x89PNG\r\n\x1a\n")):
+            self.library_with_cover(data)
+            self.assertEqual(self.listed_cover(), "", name)
+            os.unlink(os.path.join(self.library, "metadata.db"))
+
+    def test_an_enormous_cover_is_not_listed(self):
+        self.library_with_cover(self.png() + b"\x00" * (omlibria.MAX_IMAGE_BYTES + 1))
+        self.assertEqual(self.listed_cover(), "")
+
+    def test_a_cover_with_too_many_pixels_is_not_listed(self):
+        self.library_with_cover(self.png(width=40000, height=40000))
+        self.assertEqual(self.listed_cover(), "")
+
+    def test_a_cover_is_not_read_from_outside_the_library(self):
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(outside, exist_ok=True)
+        with open(os.path.join(outside, "cover.jpg"), "wb") as f:
+            f.write(self.png())
+        self.build_db(path_value="../outside")
+        self.assertEqual(json.loads(run(omlibria.scan, self.library, self.cache))["books"], [])
+
+    def test_a_cached_cover_is_reused_rather_than_rewritten(self):
+        self.library_with_cover(self.png())
+        first = self.listed_cover()
+        stamp = os.stat(first).st_mtime_ns
+        self.assertEqual(self.listed_cover(), first, "same cover, same cached copy")
+        self.assertEqual(os.stat(first).st_mtime_ns, stamp,
+                         "a second scan must not rewrite every cover")
+
+    def test_a_changed_cover_is_sanitized_again(self):
+        self.library_with_cover(self.png())
+        first = self.listed_cover()
+        bomb = zlib.compress(b"A" * (8 * 1024 * 1024))
+        path = os.path.join(self.library, "A/B (1)", "cover.jpg")
+        with open(path, "wb") as f:
+            f.write(self.png(chunks=[(b"zTXt", b"c\x00\x00" + bomb)], width=2, height=2))
+        os.utime(path, (1, 1))
+        second = self.listed_cover()
+        self.assertNotEqual(second, first, "a different file gets a different copy")
+        with open(second, "rb") as f:
+            self.assertNotIn(b"zTXt", f.read())
+
+    def test_the_cover_cache_has_a_ceiling(self):
+        self.library_with_cover(self.png())
+        folder = os.path.join(self.cache, omlibria.COVER_DIR)
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        with open(os.path.join(folder, "filler.png"), "wb") as f:
+            f.truncate(omlibria.MAX_COVER_CACHE_BYTES)   # sparse: size without bytes
+        self.assertEqual(self.listed_cover(), "",
+                         "a library must not fill the disk one cover at a time")
 
     def test_a_sound_cached_listing_is_reused(self):
         make_epub(self.epub, {"OEBPS/ok.xhtml": "<p>x</p>"})

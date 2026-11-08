@@ -197,7 +197,7 @@ Item {
   function scan() {
     if (!library) return
     scanning = true
-    scanProc.command = ["python3", helper, "scan", library]
+    scanProc.command = ["python3", helper, "scan", library, cacheRoot]
     scanProc.running = false
     scanProc.running = true
   }

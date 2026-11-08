@@ -2,7 +2,7 @@
 """Helper for the Omlibria Omarchy plugin.
 
   omlibria libraries
-  omlibria scan <library>
+  omlibria scan <library> <cache-root>
   omlibria prepare <library> <epub-relative-path> <cache-root>
   omlibria chapter <file> <max-image-width> [max-image-height] [fragment]
 
@@ -57,6 +57,21 @@ IMAGE_DIR_SUFFIX = ".images"
 # release is rebuilt instead of believed.
 META_SUFFIX = ".meta.json"
 META_VERSION = 4
+# Calibre's cover files come from the same untrusted library as metadata.db, so
+# they are sanitized before the shell decodes them, into a directory of this
+# reader's own. Books extract into <cache>/<hash>/ and write their sanitized
+# images to <cache>/<hash>.images/, so nothing a book unpacks can reach this
+# name and nothing but this helper ever writes here.
+COVER_DIR = "covers"
+# Covers are read on every scan, so one scan spends at most this long turning
+# new ones into cached copies. Books past the budget are listed without a
+# cover rather than with an unchecked one, and the next scan picks up where
+# this one stopped, because everything done already is cached.
+COVER_SECONDS = 6.0
+# And at most this much disk, counting what earlier scans already cached. A
+# library chooses how many books it lists and how big each cover is, so without
+# this a shared one could fill the disk a copy at a time.
+MAX_COVER_CACHE_BYTES = 256 * 1024 * 1024
 
 # PNG chunks worth keeping: the ones carrying pixels, and fixed-size rendering
 # hints. tEXt, zTXt, iTXt, iCCP, eXIf and anything unrecognized are dropped, so
@@ -223,7 +238,7 @@ def open_library(db):
     return con
 
 
-def scan(library):
+def scan(library, cache_root):
     db = os.path.join(library, "metadata.db")
     if not os.path.isfile(db):
         out({"error": "No metadata.db in " + library, "books": []})
@@ -270,6 +285,8 @@ def scan(library):
             epubs[r["book"]] = r["name"] or ""
 
         books = []
+        cover_deadline = time.monotonic() + COVER_SECONDS
+        cover_room = [cover_cache_room(cache_root)]
         for r in bounded(con.execute(
             "SELECT id, substr(title, 1, ?) AS title, substr(sort, 1, ?) AS sort, "
             "substr(path, 1, ?) AS path, has_cover, series_index, "
@@ -282,7 +299,16 @@ def scan(library):
             epub_path = within(library, rel)
             if not epub_path or not os.path.isfile(epub_path):
                 continue          # missing, or the database points outside the library
-            cover = within(library, posixpath.join(r["path"] or "", "cover.jpg")) or ""
+            # A cover comes from the same untrusted library as the database, so
+            # the shell is handed a sanitized copy or nothing at all. Never the
+            # library's own file: a crafted one can carry the same compressed
+            # metadata a book's images can, and the shelf decodes every cover
+            # it shows.
+            cover = ""
+            if r["has_cover"]:
+                raw = within(library, posixpath.join(r["path"] or "", "cover.jpg"))
+                if raw and os.path.isfile(raw) and time.monotonic() < cover_deadline:
+                    cover = safe_cover(raw, cache_root, cover_room)
             title = r["title"] or ""
             books.append({
                 "id": r["id"],
@@ -292,7 +318,7 @@ def scan(library):
                 "authors": ", ".join(authors.get(r["id"], [])) or "Unknown",
                 "series": series.get(r["id"], ""),
                 "seriesIndex": r["series_index"] or 0,
-                "cover": cover if r["has_cover"] and cover and os.path.isfile(cover) else "",
+                "cover": cover,
                 "added": r["timestamp"] or "",
             })
     except sqlite3.OperationalError as e:
@@ -674,24 +700,26 @@ def sanitized_jpeg(data):
     return b"".join(parts), dims
 
 
-def safe_image(path, root):
-    """Path to a metadata-free copy of `path`, cached beside the book.
+def sanitized_image(path):
+    """(bytes, (w, h), suffix, source size) for a metadata-free copy of `path`.
 
     Only PNG, JPEG and GIF are accepted, by magic bytes rather than by file
     name. Anything else -- SVG, TIFF, WebP, PDF -- would hand a different Qt
     decoder a parser of its own inside the shell, so it is refused rather than
-    sanitized.
+    sanitized. Every caller that hands the shell an image from a book or a
+    library goes through here first.
     """
+    nothing = (None, None, None, 0)
     try:
         size = os.path.getsize(path)
         if size > MAX_IMAGE_BYTES:
-            return None, None
+            return nothing
         with open(path, "rb") as f:
             data = f.read(MAX_IMAGE_BYTES + 1)
     except OSError:
-        return None, None
+        return nothing
     if len(data) > MAX_IMAGE_BYTES or len(data) < 16:
-        return None, None
+        return nothing
 
     if data[:8] == b"\x89PNG\r\n\x1a\n":
         clean, dims, suffix = sanitized_png(data) + ("png",)
@@ -702,12 +730,83 @@ def safe_image(path, root):
         # bytes, so the size and pixel bounds below are enough.
         clean, dims, suffix = data, struct.unpack("<HH", data[6:10]), "gif"
     else:
-        return None, None
+        return nothing
 
     if not clean or not dims:
-        return None, None
+        return nothing
     width, height = dims
     if not width or not height or width * height > MAX_IMAGE_PIXELS:
+        return nothing
+    return clean, dims, suffix, size
+
+
+def write_private(dest, data):
+    """Write `data` to `dest` atomically, in a directory only this user reads."""
+    try:
+        os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
+        partial = "%s.%d.part" % (dest, os.getpid())
+        with open(partial, "wb") as f:
+            f.write(data)
+        os.replace(partial, dest)
+    except OSError:
+        return False
+    return True
+
+
+def cover_cache_room(cache_root):
+    """Bytes of new covers this reader is still willing to cache."""
+    used = 0
+    try:
+        with os.scandir(os.path.join(cache_root, COVER_DIR)) as it:
+            for count, entry in enumerate(it):
+                if count >= MAX_ENTRIES:
+                    return 0
+                try:
+                    used += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    pass
+    except OSError:
+        return MAX_COVER_CACHE_BYTES          # nothing cached yet
+    return max(0, MAX_COVER_CACHE_BYTES - used)
+
+
+def safe_cover(path, cache_root, room):
+    """Path to a metadata-free copy of a library's cover, or "" if there is none.
+
+    Unlike a book's images, a cover is read on every scan, so the copy is kept
+    rather than rewritten each time. That is safe here and not there: a book
+    chooses its own entry names and unpacks into the cache, so it could land on
+    a computed name inside its extraction directory, while nothing a library
+    carries is ever written anywhere -- the library is only read -- and this
+    directory is written by this function alone.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ""
+    key = hashlib.sha1(
+        ("%s|%d|%d" % (path, st.st_size, int(st.st_mtime))).encode()).hexdigest()[:16]
+    folder = os.path.join(cache_root, COVER_DIR)
+    for suffix in ("png", "jpg", "gif"):
+        dest = os.path.join(folder, "%s.%s" % (key, suffix))
+        if os.path.isfile(dest):
+            return dest
+    clean, dims, suffix, _ = sanitized_image(path)
+    if not clean:
+        return ""           # not an image this reader will hand to a decoder
+    if len(clean) > room[0]:
+        return ""           # the cover cache is full for now
+    dest = os.path.join(folder, "%s.%s" % (key, suffix))
+    if not write_private(dest, clean):
+        return ""
+    room[0] -= len(clean)
+    return dest
+
+
+def safe_image(path, root):
+    """Path to a metadata-free copy of `path`, cached beside the book."""
+    clean, dims, suffix, size = sanitized_image(path)
+    if not clean:
         return None, None
 
     # The sanitized bytes are always written, never reused from whatever happens
@@ -717,13 +816,7 @@ def safe_image(path, root):
     name = hashlib.sha1(("%s|%d|%d" % (path, size, len(clean))).encode()).hexdigest()[:16]
     folder = root.rstrip(os.sep) + IMAGE_DIR_SUFFIX
     dest = os.path.join(folder, "%s.%s" % (name, suffix))
-    try:
-        os.makedirs(folder, mode=0o700, exist_ok=True)
-        partial = "%s.%d.part" % (dest, os.getpid())
-        with open(partial, "wb") as f:
-            f.write(clean)
-        os.replace(partial, dest)
-    except OSError:
+    if not write_private(dest, clean):
         return None, None
     return dest, dims
 
@@ -995,7 +1088,7 @@ def main(argv):
         if cmd == "libraries":
             libraries()
         elif cmd == "scan":
-            scan(argv[2])
+            scan(argv[2], argv[3])
         elif cmd == "prepare":
             prepare(argv[2], argv[3], argv[4])
         elif cmd == "chapter":

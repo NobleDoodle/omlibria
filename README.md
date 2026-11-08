@@ -138,7 +138,8 @@ omarchy-shell omlibria library "/path/to/Calibre Library"
 
 - `~/.local/state/omarchy/settings/omlibria.json`: library, last book,
   per-book position, font size, panel size, library layout.
-- `~/.cache/omarchy/omlibria/`: extracted EPUBs, safe to delete.
+- `~/.cache/omarchy/omlibria/`: extracted EPUBs and sanitized cover copies,
+  safe to delete.
 
 ## Limits
 
@@ -165,9 +166,10 @@ you install. For Omlibria:
   beside the extracted copy rather than inside it, and checked field by field
   before it is believed.
 - **Images are stripped before they are shown.** A book's PNG, JPEG and GIF
-  images are copied into the cache with every metadata chunk removed, so no
-  attacker-chosen metadata reaches the renderer's decoders; other formats are
-  refused rather than handed to a decoder of their own.
+  images *and the library's cover files* are copied into the cache with every
+  metadata chunk removed, so no attacker-chosen metadata reaches the renderer's
+  decoders; other formats are refused rather than handed to a decoder of their
+  own, and a cover that cannot be sanitized is shown as a plain initial.
 - **Every label renders plain text.** A title, a library path or an error
   message is never sniffed for markup, so nothing a book carries can make the
   shell request a URL.
