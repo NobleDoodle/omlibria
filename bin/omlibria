@@ -41,9 +41,34 @@ MAX_SPINE = 20000
 # the file, and its header can claim dimensions no one wants decoded. Images
 # are therefore stripped of metadata and bounded before the reader sees them.
 MAX_IMAGE_BYTES = 32 * 1024 * 1024    # one image file inside a book
-MAX_IMAGE_PIXELS = 24000000           # width x height the renderer will decode
-                                      # (the largest image in a real library here is 3.3 MP)
+MAX_IMAGE_PIXELS = 12000000           # width x height the renderer will decode
+                                      # (the largest image in a real library here is 5.2 MP)
+# The reader lays a whole section out as one document and decodes every image
+# in it at full size, whatever size it is drawn at. Bounding each image is not
+# enough, so a section also has a budget: once its images would hold this much
+# decoded memory, or there are this many of them, the rest are left out. The
+# heaviest section in a 58-book library holds 18 images and 153 MB.
+MAX_CHAPTER_IMAGES = 200
+MAX_CHAPTER_IMAGE_BYTES = 256 * 1024 * 1024
+# The same goes for the text. Qt lays the section out on the shell's own
+# thread, so its cost is the shell's: nested tables double the layout time
+# with every level (twenty levels freeze it for half a minute, from a section
+# of 661 bytes), deep nesting is quadratic, and plain length is linear. Each is
+# bounded at two to three times what the heaviest real section needs
+# (0.5 M characters, 66,000 elements, 2,222 table cells, tables one deep).
+MAX_CHAPTER_TEXT = 1200000            # characters shown from one section
+MAX_CHAPTER_TAGS = 160000             # elements written out for one section
+MAX_TABLE_CELLS = 6000
+MAX_TABLE_DEPTH = 2                   # a table inside a table inside a table is flattened
+MAX_NESTING = 64                      # open elements, wrappers included
+MAX_LINK = 2000                       # characters in a link target
+# Whatever a book or library contains, one run of this helper gets this much
+# processor time, wall-clock time and memory, and is stopped at the limit.
+HELPER_CPU_SECONDS = {"libraries": 20, "scan": 60, "prepare": 120, "chapter": 30}
+HELPER_WALL_SECONDS = 300
+HELPER_MEMORY_BYTES = 1536 * 1024 * 1024
 MAX_IMAGE_PARTS = 512                 # chunks or segments before a file is refused
+MAX_JPEG_SCANS = 64                   # encoders write about ten; each costs a full pass
 
 # Names this reader owns inside a book's extraction directory. A book is a zip
 # whose entry names it chooses, so without this it could ship a file that looks
@@ -349,6 +374,10 @@ def read_xml(path):
         data = f.read(MAX_XML_BYTES + 1)
     if len(data) > MAX_XML_BYTES:
         raise ValueError("XML file is too large")
+    # The check below reads ASCII. UTF-16 and UTF-32 spell the same declaration
+    # with a zero byte between every letter and would walk straight past it.
+    if b"\x00" in data or data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        raise ValueError("XML must be UTF-8")
     # ElementTree does not fetch external entities, but it will happily expand
     # nested internal ones until the process runs out of memory.
     if re.search(rb"<!DOCTYPE[^>]*\[", data, re.I) or re.search(rb"<!ENTITY", data, re.I):
@@ -634,26 +663,33 @@ def prepare(library, rel, cache_root):
 # --------------------------------------------------------------------------
 
 def sanitized_png(data):
-    """PNG bytes with every ancillary metadata chunk removed, and its size.
+    """PNG bytes with every ancillary metadata chunk removed, its size, and how
+    many bytes a decoded pixel takes.
 
     Walking the chunk list and copying only the ones above is what contains the
     expansion: libpng is never handed a compressed text or profile chunk, so
-    there is no ratio to get wrong.
+    there is no ratio to get wrong. The header must be the first chunk and the
+    only one of its kind, so the size checked here is the size libpng decodes.
     """
-    parts, dims, pos, count, ended = [data[:8]], None, 8, 0, False
+    nothing = (None, None, 0)
+    parts, dims, pixel, pos, count, ended = [data[:8]], None, 4, 8, 0, False
     while pos + 12 <= len(data):
         length = struct.unpack(">I", data[pos:pos + 4])[0]
         ctype = data[pos + 4:pos + 8]
         end = pos + 12 + length
         if length > MAX_IMAGE_BYTES or end > len(data):
-            return None, None
+            return nothing
         count += 1
         if count > MAX_IMAGE_PARTS:
-            return None, None
+            return nothing
+        if (ctype == b"IHDR") != (count == 1):
+            return nothing          # no header first, or a second one later
         if ctype == b"IHDR":
-            if length < 13:
-                return None, None
+            if length != 13:
+                return nothing
             dims = struct.unpack(">II", data[pos + 8:pos + 16])
+            # Sixteen-bit samples decode to a sixteen-bit image: twice the bytes.
+            pixel = 8 if data[pos + 16] == 16 else 4
         if ctype in PNG_KEEP:
             parts.append(data[pos:end])
         pos = end
@@ -661,83 +697,120 @@ def sanitized_png(data):
             ended = True
             break
     if not dims or not ended:
-        return None, None
-    return b"".join(parts), dims
+        return nothing
+    return b"".join(parts), dims, pixel
+
+
+# Entropy-coded scan data runs until the next marker that is neither a stuffed
+# zero, a restart, nor a fill byte.
+JPEG_SCAN_END = re.compile(rb"\xff[^\x00\xd0-\xd7\xff]")
 
 
 def sanitized_jpeg(data):
-    """JPEG bytes with every APPn and comment segment removed, and its size."""
-    parts, dims, pos, count = [data[:2]], None, 2, 0
-    while pos + 4 <= len(data):
+    """JPEG bytes with every APPn and comment segment removed, its size, and
+    how many bytes a decoded pixel takes.
+
+    The whole file is walked, scans included, rather than copied through from
+    the first scan on: a progressive JPEG may carry any number of scans, and
+    the decoder makes a full pass over the image for each one, so a few hundred
+    kilobytes of repeated scans can hold it busy for minutes. Files with more
+    scans than any encoder writes are refused, as are a second frame header
+    (the size checked here must be the size that is decoded) and anything after
+    the end-of-image marker.
+    """
+    nothing = (None, None, 0)
+    parts, dims, pos, count, scans, ended = [data[:2]], None, 2, 0, 0, False
+    size = len(data)
+    while pos + 2 <= size:
         if data[pos] != 0xFF:
-            return None, None
+            return nothing
         marker = data[pos + 1]
-        if marker == 0x01 or 0xD0 <= marker <= 0xD9:
-            parts.append(data[pos:pos + 2])     # standalone marker, no payload
-            pos += 2
+        if marker == 0xFF:                      # fill byte before a marker
+            pos += 1
             continue
+        if marker == 0xD9:                      # end of image
+            ended = True
+            break
+        if marker == 0xD8:
+            return nothing                      # a second image inside this one
+        if marker == 0x01 or 0xD0 <= marker <= 0xD7:
+            pos += 2                            # stray standalone marker: drop it
+            continue
+        if pos + 4 > size:
+            return nothing
         length = struct.unpack(">H", data[pos + 2:pos + 4])[0]
         end = pos + 2 + length
-        if length < 2 or end > len(data):
-            return None, None
+        if length < 2 or end > size:
+            return nothing
         count += 1
         if count > MAX_IMAGE_PARTS:
-            return None, None
+            return nothing
         if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
-            if length < 7:
-                return None, None
+            if dims or length < 8:
+                return nothing                  # two frame headers, or a short one
             height, width = struct.unpack(">HH", data[pos + 5:pos + 9])
             dims = (width, height)
         # APPn carries EXIF, ICC and XMP; COM is a free-text comment.
         if not (0xE0 <= marker <= 0xEF or marker == 0xFE):
             parts.append(data[pos:end])
         pos = end
-        if marker == 0xDA:                      # start of scan: entropy-coded data follows
-            parts.append(data[end:])
-            break
-    if not dims:
-        return None, None
-    return b"".join(parts), dims
+        if marker == 0xDA:                      # start of scan
+            if not dims:
+                return nothing                  # a scan before any frame header
+            scans += 1
+            if scans > MAX_JPEG_SCANS:
+                return nothing
+            nxt = JPEG_SCAN_END.search(data, pos)
+            stop = nxt.start() if nxt else size
+            parts.append(data[pos:stop])
+            pos = stop
+    if not dims or not scans:
+        return nothing
+    parts.append(b"\xff\xd9")                  # exactly one end marker, nothing after it
+    return b"".join(parts), dims, 4
 
 
 def sanitized_image(path):
-    """(bytes, (w, h), suffix, source size) for a metadata-free copy of `path`.
+    """A metadata-free copy of the image at `path`, or None.
 
-    Only PNG, JPEG and GIF are accepted, by magic bytes rather than by file
-    name. Anything else -- SVG, TIFF, WebP, PDF -- would hand a different Qt
-    decoder a parser of its own inside the shell, so it is refused rather than
-    sanitized. Every caller that hands the shell an image from a book or a
-    library goes through here first.
+    Returned as (bytes, (w, h), suffix, source size, cost), where cost is the
+    memory the decoded image occupies in the shell. Only PNG, JPEG and GIF are
+    accepted, by magic bytes rather than by file name. Anything else -- SVG,
+    TIFF, WebP, PDF -- would hand a different Qt decoder a parser of its own
+    inside the shell, so it is refused rather than sanitized. Every caller that
+    hands the shell an image from a book or a library goes through here first.
     """
-    nothing = (None, None, None, 0)
     try:
         size = os.path.getsize(path)
         if size > MAX_IMAGE_BYTES:
-            return nothing
+            return None
         with open(path, "rb") as f:
             data = f.read(MAX_IMAGE_BYTES + 1)
     except OSError:
-        return nothing
+        return None
     if len(data) > MAX_IMAGE_BYTES or len(data) < 16:
-        return nothing
+        return None
 
     if data[:8] == b"\x89PNG\r\n\x1a\n":
-        clean, dims, suffix = sanitized_png(data) + ("png",)
+        clean, dims, pixel = sanitized_png(data)
+        suffix = "png"
     elif data[:2] == b"\xff\xd8":
-        clean, dims, suffix = sanitized_jpeg(data) + ("jpg",)
+        clean, dims, pixel = sanitized_jpeg(data)
+        suffix = "jpg"
     elif data[:6] in (b"GIF87a", b"GIF89a"):
         # GIF has no compressed-metadata path; its extension blocks are plain
-        # bytes, so the size and pixel bounds below are enough.
-        clean, dims, suffix = data, struct.unpack("<HH", data[6:10]), "gif"
+        # bytes, and the decoder clips every frame to the canvas declared here,
+        # so the size and pixel bounds below are enough.
+        clean, dims, pixel, suffix = data, struct.unpack("<HH", data[6:10]), 4, "gif"
     else:
-        return nothing
+        return None
 
     if not clean or not dims:
-        return nothing
+        return None
     width, height = dims
     if not width or not height or width * height > MAX_IMAGE_PIXELS:
-        return nothing
-    return clean, dims, suffix, size
+        return None
+    return clean, dims, suffix, size, width * height * pixel
 
 
 def write_private(dest, data):
@@ -791,9 +864,10 @@ def safe_cover(path, cache_root, room):
         dest = os.path.join(folder, "%s.%s" % (key, suffix))
         if os.path.isfile(dest):
             return dest
-    clean, dims, suffix, _ = sanitized_image(path)
-    if not clean:
+    image = sanitized_image(path)
+    if not image:
         return ""           # not an image this reader will hand to a decoder
+    clean, suffix = image[0], image[2]
     if len(clean) > room[0]:
         return ""           # the cover cache is full for now
     dest = os.path.join(folder, "%s.%s" % (key, suffix))
@@ -804,10 +878,11 @@ def safe_cover(path, cache_root, room):
 
 
 def safe_image(path, root):
-    """Path to a metadata-free copy of `path`, cached beside the book."""
-    clean, dims, suffix, size = sanitized_image(path)
-    if not clean:
-        return None, None
+    """(path, (w, h), cost) for a metadata-free copy of `path` beside the book."""
+    image = sanitized_image(path)
+    if not image:
+        return None
+    clean, dims, suffix, size, cost = image
 
     # The sanitized bytes are always written, never reused from whatever happens
     # to sit at this path: a book could otherwise ship a file at the name this
@@ -817,8 +892,8 @@ def safe_image(path, root):
     folder = root.rstrip(os.sep) + IMAGE_DIR_SUFFIX
     dest = os.path.join(folder, "%s.%s" % (name, suffix))
     if not write_private(dest, clean):
-        return None, None
-    return dest, dims
+        return None
+    return dest, dims, cost
 
 
 def parse_css(text, rules):
@@ -855,6 +930,7 @@ LINK_CLOSE = "\u2064"  # invisible plus
 SENTINELS = (MARKER, LINK_OPEN, LINK_CLOSE)
 LINE_SPREAD = 1.4       # slack for the reader's paragraph line-height
 TEXT_BLOCKS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "pre", "td", "th", "blockquote"}
+TABLE_PARTS = {"table", "thead", "tbody", "tfoot", "tr", "td", "th"}
 
 
 class Converter(HTMLParser):
@@ -874,6 +950,23 @@ class Converter(HTMLParser):
         self.blk = 0         # depth of explicit text blocks (p, h1, li, ...)
         self.wrap_open = False
         self.last_text = False
+        # What this section has cost so far, against the limits at the top.
+        self.full = False
+        self.text = self.tags = self.cells = self.tables = self.flat = 0
+        self.images, self.image_bytes, self.image_note = {}, 0, False
+
+    def finish(self):
+        """Close what is open and stop: the section has reached a limit."""
+        if self.full:
+            return
+        for _, close_html, wrapper, _ in reversed(self.stack):
+            if not wrapper:
+                self.o.append(close_html)
+        self.stack = []
+        self.close_wrapper()
+        self.o.append('<p align="center"><i>This section is longer than Omlibria shows '
+                      'at once. The rest of it is not displayed.</i></p>')
+        self.full = True
 
     def styles_for(self, tag, attrs):
         cls = (dict(attrs).get("class") or "").lower().split()
@@ -892,7 +985,11 @@ class Converter(HTMLParser):
         if tag in SKIP:
             self.skip += 1
             return
-        if self.skip:
+        if self.skip or self.full:
+            return
+        self.tags += 1
+        if self.tags > MAX_CHAPTER_TAGS:
+            self.finish()
             return
         a = dict(attrs)
         if self.fragment and self.fragment in (a.get("id"), a.get("name")):
@@ -910,11 +1007,29 @@ class Converter(HTMLParser):
             self.close_wrapper()
             self.o.append("<hr/>")
             return
+        if len(self.stack) >= MAX_NESTING:
+            return             # deeper than any real book nests: the text still flows
         styles = self.styles_for(tag, attrs)
         name = {"strong": "b", "em": "i"}.get(tag, tag)
         if name in WRAPPERS:
-            self.stack.append((tag, "", True))
+            self.stack.append((tag, "", True, None))
             return
+        # Qt's layout time doubles with every level of table nesting, so tables
+        # past the second level are flattened: their cells become plain text
+        # in the cell that holds them.
+        if name in TABLE_PARTS and (self.flat or (name == "table" and self.tables >= MAX_TABLE_DEPTH)):
+            self.flat += name == "table"
+            self.stack.append((tag, " ", False, "flat" if name == "table" else None))
+            return
+        kind = None
+        if name == "table":
+            self.tables += 1
+            kind = "table"
+        elif name in ("td", "th"):
+            self.cells += 1
+            if self.cells > MAX_TABLE_CELLS:
+                self.finish()
+                return
         open_html = close_html = ""
         link = self.link_for(a.get("href")) if name == "a" else None
         if link:
@@ -948,7 +1063,7 @@ class Converter(HTMLParser):
             open_html += "<u>"
             close_html = "</u>" + close_html
         self.o.append(open_html)
-        self.stack.append((tag, close_html, False))
+        self.stack.append((tag, close_html, False, kind))
 
     def handle_startendtag(self, tag, attrs):
         tag = tag.lower()
@@ -963,16 +1078,22 @@ class Converter(HTMLParser):
         if tag in SKIP:
             self.skip = max(0, self.skip - 1)
             return
-        if self.skip:
+        if self.skip or self.full:
             return
         for i in range(len(self.stack) - 1, -1, -1):
             if self.stack[i][0] != tag:
                 continue
-            for t, close_html, wrapper in reversed(self.stack[i:]):
+            for t, close_html, wrapper, kind in reversed(self.stack[i:]):
                 if wrapper:
                     self.close_wrapper()
                     continue
                 self.o.append(close_html)
+                if kind == "table":
+                    self.tables = max(0, self.tables - 1)
+                elif kind == "flat":
+                    self.flat = max(0, self.flat - 1)
+                if close_html == " ":
+                    continue           # a flattened table part: nothing was opened
                 if t == "pre":
                     self.pre = max(0, self.pre - 1)
                 if t in TEXT_BLOCKS:
@@ -981,8 +1102,14 @@ class Converter(HTMLParser):
             return
 
     def handle_data(self, data):
-        if self.skip:
+        if self.skip or self.full:
             return
+        room = MAX_CHAPTER_TEXT - self.text
+        if len(data) > room:
+            data = data[:max(0, room)]
+            self.text = MAX_CHAPTER_TEXT + 1
+        else:
+            self.text += len(data)
         for ch in SENTINELS:
             if ch in data:
                 data = data.replace(ch, "")   # never let a book's own text look like a sentinel
@@ -1001,10 +1128,12 @@ class Converter(HTMLParser):
             self.marker_due = False
         self.o.append(html.escape(data, quote=False))
         self.last_text = True
+        if self.text > MAX_CHAPTER_TEXT:
+            self.finish()
 
     def link_for(self, href):
         """Internal links become epub:<abs path>#<fragment>; web links pass through."""
-        if not href:
+        if not href or len(href) > MAX_LINK:
             return None
         if href.startswith(("http:", "https:")):
             return href
@@ -1023,9 +1152,28 @@ class Converter(HTMLParser):
         path = contained(os.path.join(self.base, urllib.parse.unquote(src.split("#")[0])), self.root)
         if not path or not os.path.isfile(path):
             return             # image source outside the book, or missing
-        path, size = safe_image(path, self.root)
-        if not path:
+        # Each image is sanitized once per section however often it is used,
+        # and counted against the section's budget the first time.
+        if path not in self.images:
+            got = "over"
+            if len(self.images) < MAX_CHAPTER_IMAGES:
+                got = safe_image(path, self.root)
+                if got and self.image_bytes + got[2] > MAX_CHAPTER_IMAGE_BYTES:
+                    got = "over"
+                elif got:
+                    self.image_bytes += got[2]
+            self.images[path] = got
+        got = self.images[path]
+        if got == "over":
+            if not self.image_note:
+                self.image_note = True
+                self.close_wrapper()
+                self.o.append('<p align="center"><i>Some images in this section are not shown: '
+                              'it holds more image data than Omlibria loads at once.</i></p>')
+            return
+        if not got:
             return             # unsupported format, oversized, or malformed
+        path, size = got[0], got[1]
         attrs = ""
         # A standalone image goes in its own block. That block is a div rather
         # than a paragraph so the reader's paragraph line-height does not apply
@@ -1079,12 +1227,41 @@ def chapter(path, max_w, max_h=0, fragment=""):
     write_out(body)
 
 
+class HelperStopped(Exception):
+    """This run reached its processor or wall-clock limit."""
+
+
+def confine(cmd):
+    """Give this run a fixed share of the machine, whatever its input does.
+
+    Markup, stylesheets and databases from a book or a library are parsed
+    here, and a crafted one can make a parser do far more work than its size
+    suggests. Rather than trust every pattern to be linear, the process as a
+    whole is bounded: the soft limits raise a clean refusal, and the hard ones
+    stop it outright if it is stuck somewhere that cannot be interrupted.
+    """
+    import resource
+    import signal
+
+    def stop(signum, frame):
+        raise HelperStopped("took longer than this reader allows")
+
+    cpu = HELPER_CPU_SECONDS.get(cmd, 30)
+    signal.signal(signal.SIGXCPU, stop)
+    signal.signal(signal.SIGALRM, stop)
+    resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 5))
+    resource.setrlimit(resource.RLIMIT_AS, (HELPER_MEMORY_BYTES, HELPER_MEMORY_BYTES))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    signal.alarm(HELPER_WALL_SECONDS)
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__)
         return 2
     cmd = argv[1]
     try:
+        confine(cmd)
         if cmd == "libraries":
             libraries()
         elif cmd == "scan":

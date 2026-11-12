@@ -170,6 +170,13 @@ you install. For Omlibria:
   metadata chunk removed, so no attacker-chosen metadata reaches the renderer's
   decoders; other formats are refused rather than handed to a decoder of their
   own, and a cover that cannot be sanitized is shown as a plain initial.
+- **A section has a budget.** The reader lays a whole section out at once on
+  the shell's own thread, so one section may hold at most 256 MB of decoded
+  images (200 of them, 12 megapixels each), 1.2 million characters, 160,000
+  elements and 6,000 table cells; tables nest two deep and anything deeper is
+  flattened. Past a limit the section ends with a note saying so. JPEGs with
+  more scans than encoders write are refused, and the helper itself runs under
+  fixed processor, time and memory limits.
 - **Every label renders plain text.** A title, a library path or an error
   message is never sniffed for markup, so nothing a book carries can make the
   shell request a URL.

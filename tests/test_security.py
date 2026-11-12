@@ -294,7 +294,7 @@ class HelperSecurity(unittest.TestCase):
         self.assertIn(b"zTXt", data)
         self.assertLess(len(data), 64 * 1024, "the bomb is small on disk")
         path = self.write_image("bomb.png", data)
-        clean, dims = omlibria.safe_image(path, self.library)
+        clean, dims, _ = omlibria.safe_image(path, self.library)
         self.assertTrue(clean)
         with open(clean, "rb") as f:
             out = f.read()
@@ -307,7 +307,7 @@ class HelperSecurity(unittest.TestCase):
                                 (b"iCCP", b"P\x00\x00" + zlib.compress(b"C" * 4096)),
                                 (b"eXIf", b"E" * 64)])
         path = self.write_image("meta.png", data)
-        clean, _ = omlibria.safe_image(path, self.library)
+        clean, _, _ = omlibria.safe_image(path, self.library)
         with open(clean, "rb") as f:
             out = f.read()
         for kind in (b"tEXt", b"iTXt", b"iCCP", b"eXIf"):
@@ -317,24 +317,24 @@ class HelperSecurity(unittest.TestCase):
     def test_png_claiming_huge_dimensions_is_refused(self):
         data = self.png(width=40000, height=40000)      # 1.6e9 pixels to decode
         path = self.write_image("huge.png", data)
-        self.assertEqual(omlibria.safe_image(path, self.library), (None, None))
+        self.assertIsNone(omlibria.safe_image(path, self.library))
 
     def test_formats_with_their_own_decoder_are_refused(self):
         for name, blob in (("x.svg", b"<svg xmlns='http://www.w3.org/2000/svg'><rect/></svg>" + b" " * 32),
                            ("x.webp", b"RIFF\x00\x00\x00\x00WEBPVP8 " + b"\0" * 32),
                            ("x.tif", b"II*\x00" + b"\0" * 64)):
             path = self.write_image(name, blob)
-            self.assertEqual(omlibria.safe_image(path, self.library), (None, None), name)
+            self.assertIsNone(omlibria.safe_image(path, self.library), name)
 
     def test_oversized_and_malformed_images_are_refused(self):
         big = self.write_image("big.png", b"\x89PNG\r\n\x1a\n" + b"\0" * 4096)
         omlibria.MAX_IMAGE_BYTES = 512
         try:
-            self.assertEqual(omlibria.safe_image(big, self.library), (None, None))
+            self.assertIsNone(omlibria.safe_image(big, self.library))
         finally:
             omlibria.MAX_IMAGE_BYTES = 32 * 1024 * 1024
         truncated = self.write_image("cut.png", self.png()[:-8])   # no IEND
-        self.assertEqual(omlibria.safe_image(truncated, self.library), (None, None))
+        self.assertIsNone(omlibria.safe_image(truncated, self.library))
 
     def test_jpeg_application_segments_are_stripped(self):
         payload = b"Exif\x00\x00" + b"E" * 60000
@@ -344,7 +344,7 @@ class HelperSecurity(unittest.TestCase):
                + b"\x01" + b"\x01\x11\x00")
         data = b"\xff\xd8" + app1 + sof + b"\xff\xda" + struct.pack(">H", 2) + b"scan" + b"\xff\xd9"
         path = self.write_image("meta.jpg", data)
-        clean, dims = omlibria.safe_image(path, self.library)
+        clean, dims, _ = omlibria.safe_image(path, self.library)
         with open(clean, "rb") as f:
             out = f.read()
         self.assertEqual(dims, (4, 4))
@@ -368,11 +368,11 @@ class HelperSecurity(unittest.TestCase):
         """The cache name is computable from a book, so its bytes are never trusted."""
         good = self.png()
         path = self.write_image("real.png", good)
-        clean, _ = omlibria.safe_image(path, self.library)      # learn the computed name
+        clean, _, _ = omlibria.safe_image(path, self.library)      # learn the computed name
         bomb = self.png(chunks=[(b"zTXt", b"C\x00\x00" + zlib.compress(b"A" * (8 * 1024 * 1024)))])
         with open(clean, "wb") as f:                            # preseed it, as a crafted book would
             f.write(bomb)
-        served, _ = omlibria.safe_image(path, self.library)
+        served, _, _ = omlibria.safe_image(path, self.library)
         self.assertEqual(served, clean, "same name, so the poisoned file is the one in the way")
         with open(served, "rb") as f:
             out = f.read()
@@ -435,6 +435,144 @@ class HelperSecurity(unittest.TestCase):
             self.assertTrue(book["spine"], repr(bad))
             self.assertTrue(book["spine"][0]["file"].startswith(book["dir"] + os.sep),
                             repr(bad))
+
+    # ---- what one section may cost the shell --------------------------------
+
+    def big_png(self, width, height, shade):
+        """A valid, highly compressible PNG: large to decode, tiny on disk."""
+        def chunk(kind, payload):
+            return (struct.pack(">I", len(payload)) + kind + payload
+                    + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF))
+        row = b"\x00" + bytes((shade, shade, shade)) * width
+        packer = zlib.compressobj(1)
+        body = b"".join(packer.compress(row) for _ in range(height)) + packer.flush()
+        return (b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", body) + chunk(b"IEND", b""))
+
+    def test_a_sections_images_share_one_memory_budget(self):
+        """Many large images in one paragraph: each passes alone, together they
+        would hold gigabytes, so the section stops at its budget."""
+        files = {"OEBPS/ok.xhtml": "<p>%s</p>" % "".join(
+            '<img src="i%d.png"/>' % i for i in range(12))}
+        for i in range(12):
+            files["OEBPS/i%d.png" % i] = self.big_png(3000, 3900, i)     # 11.7 MP, 47 MB decoded
+        make_epub(self.epub, files)
+        book = self.prepare()
+        out = run(omlibria.chapter, book["spine"][0]["file"], 400, 477, "")
+        shown = len(set(re.findall(r'src="file://([^"]+)"', out)))
+        cost = 3000 * 3900 * 4
+        self.assertEqual(shown, omlibria.MAX_CHAPTER_IMAGE_BYTES // cost)
+        self.assertLess(shown, 12)
+        self.assertEqual(out.count("Some images in this section are not shown"), 1)
+
+    def test_a_repeated_image_is_sanitized_and_counted_once(self):
+        make_epub(self.epub, {"OEBPS/ok.xhtml": "<p>%s</p>" % ('<img src="x.png"/>' * 500),
+                              "OEBPS/x.png": self.png()})
+        book = self.prepare()
+        out = run(omlibria.chapter, book["spine"][0]["file"], 400, 477, "")
+        self.assertEqual(out.count("<img"), 500)
+        self.assertEqual(len(os.listdir(book["dir"] + omlibria.IMAGE_DIR_SUFFIX)), 1)
+
+    def test_tables_nested_past_the_limit_are_flattened(self):
+        """Qt's table layout doubles in cost per nesting level: 20 levels freeze
+        the shell for half a minute from a section of a few hundred bytes."""
+        deep = "<table><tr><td>" * 40 + "inner" + "</td></tr></table>" * 40
+        out = self.chapter(deep)
+        self.assertEqual(out.count("<table"), omlibria.MAX_TABLE_DEPTH)
+        self.assertIn("inner", out, "the text is kept, only the nesting goes")
+
+    def test_nesting_deeper_than_any_book_is_not_reproduced(self):
+        out = self.chapter("<p>" + "<b>" * 5000 + "deep" + "</b>" * 5000 + "</p>")
+        self.assertLessEqual(out.count("<b>"), omlibria.MAX_NESTING)
+        self.assertIn("deep", out)
+
+    def test_a_section_stops_at_its_text_limit(self):
+        out = self.chapter("<p>%s</p><p>tail-marker</p>" % ("word " * 400000))
+        self.assertIn("This section is longer than Omlibria shows", out)
+        self.assertNotIn("tail-marker", out)
+        self.assertLess(len(out), omlibria.MAX_CHAPTER_TEXT + 4096)
+
+    def test_a_section_stops_at_its_element_and_cell_limits(self):
+        out = self.chapter("<p>x</p>" * (omlibria.MAX_CHAPTER_TAGS + 500))
+        self.assertLessEqual(out.count("<p>"), omlibria.MAX_CHAPTER_TAGS)
+        self.assertIn("This section is longer than Omlibria shows", out)
+        cells = "<table>%s</table>" % ("<tr>%s</tr>" % ("<td>c</td>" * 100) * 100)
+        out = self.chapter(cells)
+        self.assertLessEqual(out.count("<td>"), omlibria.MAX_TABLE_CELLS)
+
+    def test_a_jpeg_with_more_scans_than_any_encoder_writes_is_refused(self):
+        """Each scan is a full pass over the image in the decoder, so thousands
+        of tiny repeated scans hold the shell busy for minutes."""
+        def segment(marker, payload):
+            return b"\xff" + bytes((marker,)) + struct.pack(">H", len(payload) + 2) + payload
+        head = (b"\xff\xd8" + segment(0xDB, b"\x00" + bytes(64))
+                + segment(0xC2, b"\x08" + struct.pack(">HH", 16, 16) + b"\x01\x01\x11\x00"))
+        scan = segment(0xDA, b"\x01\x01\x00\x00\x00\x00") + b"\x12\x34"
+        fine = head + scan * 10 + b"\xff\xd9"
+        bomb = head + scan * (omlibria.MAX_JPEG_SCANS + 1) + b"\xff\xd9"
+        clean, dims, _ = omlibria.sanitized_jpeg(fine)
+        self.assertEqual(dims, (16, 16))
+        self.assertEqual(clean.count(b"\xff\xda"), 10)
+        self.assertEqual(omlibria.sanitized_jpeg(bomb), (None, None, 0))
+
+    def test_metadata_after_the_first_scan_is_stripped_too(self):
+        def segment(marker, payload):
+            return b"\xff" + bytes((marker,)) + struct.pack(">H", len(payload) + 2) + payload
+        data = (b"\xff\xd8" + segment(0xC0, b"\x08" + struct.pack(">HH", 4, 4) + b"\x01\x01\x11\x00")
+                + segment(0xDA, b"\x01\x01\x00\x00\x3f\x00") + b"\x55"
+                + segment(0xFE, b"SECRET-COMMENT") + segment(0xE1, b"Exif-LATER")
+                + b"\xff\xd9" + b"TRAILING-JUNK")
+        clean, dims, _ = omlibria.sanitized_jpeg(data)
+        self.assertEqual(dims, (4, 4))
+        for junk in (b"SECRET-COMMENT", b"Exif-LATER", b"TRAILING-JUNK"):
+            self.assertNotIn(junk, clean)
+        self.assertTrue(clean.endswith(b"\xff\xd9"))
+
+    def test_an_image_with_two_headers_is_refused(self):
+        """The size that is checked must be the size that is decoded."""
+        def chunk(kind, payload):
+            return (struct.pack(">I", len(payload)) + kind + payload
+                    + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF))
+        huge = chunk(b"IHDR", struct.pack(">IIBBBBB", 40000, 40000, 8, 2, 0, 0, 0))
+        good = self.png()
+        self.assertEqual(omlibria.sanitized_png(good[:8] + huge + good[8:]), (None, None, 0))
+        def segment(marker, payload):
+            return b"\xff" + bytes((marker,)) + struct.pack(">H", len(payload) + 2) + payload
+        sof = lambda w, h: segment(0xC0, b"\x08" + struct.pack(">HH", h, w) + b"\x01\x01\x11\x00")
+        two = (b"\xff\xd8" + sof(60000, 60000) + sof(1, 1)
+               + segment(0xDA, b"\x01\x01\x00\x00\x3f\x00") + b"\x55\xff\xd9")
+        self.assertEqual(omlibria.sanitized_jpeg(two), (None, None, 0))
+
+    def test_sixteen_bit_images_are_costed_at_their_decoded_size(self):
+        eight = omlibria.sanitized_png(self.png())
+        data = bytearray(self.png())
+        data[24] = 16                                   # bit depth, inside IHDR
+        self.assertEqual(eight[2], 4)
+        self.assertEqual(omlibria.sanitized_png(bytes(data))[2], 8)
+
+    def test_utf16_xml_cannot_slip_an_entity_past_the_check(self):
+        doc = ('<?xml version="1.0" encoding="UTF-16"?><!DOCTYPE c [<!ENTITY a "%s">]>'
+               '<container>%s</container>' % ("x" * 1000, "&a;" * 50))
+        for encoding in ("utf-16", "utf-16-le", "utf-16-be", "utf-32"):
+            path = os.path.join(self.tmp, "c.xml")
+            with open(path, "wb") as f:
+                f.write(doc.encode(encoding))
+            with self.assertRaises(ValueError, msg=encoding):
+                omlibria.read_xml(path)
+
+    def test_the_helper_stops_itself_at_its_processor_limit(self):
+        import subprocess
+        code = ("import importlib.machinery, importlib.util, sys\n"
+                "l = importlib.machinery.SourceFileLoader('omlibria', sys.argv[1])\n"
+                "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('omlibria', l))\n"
+                "l.exec_module(m)\n"
+                "m.HELPER_CPU_SECONDS['chapter'] = 1\n"
+                "m.chapter = lambda *a: [None for _ in iter(int, 1)]\n"
+                "sys.exit(m.main(['omlibria', 'chapter', '/nonexistent', '100']))\n")
+        done = subprocess.run([sys.executable, "-I", "-c", code, HELPER],
+                              capture_output=True, text=True, timeout=60)
+        self.assertIn("took longer than this reader allows", done.stdout)
 
     # ---- covers, which come from the library rather than a book -----------
 

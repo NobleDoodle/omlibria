@@ -205,7 +205,8 @@ FocusScope {
           settle.restart()
           return
         }
-        root.chapterHtml = text
+        // A helper stopped at one of its limits prints nothing at all.
+        root.chapterHtml = text ? text : "<p>This section could not be shown.</p>"
         bodyHost.active = true       // a fresh text item, already holding the new text
         settle.restart()
       }
