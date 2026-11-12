@@ -62,6 +62,15 @@ MAX_TABLE_CELLS = 6000
 MAX_TABLE_DEPTH = 2                   # a table inside a table inside a table is flattened
 MAX_NESTING = 64                      # open elements, wrappers included
 MAX_LINK = 2000                       # characters in a link target
+MAX_TOC = MAX_SPINE * 2               # table of contents entries kept from one book
+MAX_TAG = 4096                        # characters searched for the end of one tag
+# Extracted books are kept so reopening one is instant, but a library is
+# unbounded and every book opened leaves up to MAX_TOTAL_BYTES behind. Past
+# this, the books opened longest ago are removed when another is extracted.
+MAX_BOOK_CACHE_BYTES = 2 * 1024 * 1024 * 1024
+# Looking for libraries walks the home directory, which can be enormous.
+LIBRARY_SEARCH_SECONDS = 5.0
+LIBRARY_SEARCH_DIRS = 20000
 # Whatever a book or library contains, one run of this helper gets this much
 # processor time, wall-clock time and memory, and is stopped at the limit.
 HELPER_CPU_SECONDS = {"libraries": 20, "scan": 60, "prepare": 120, "chapter": 30}
@@ -219,7 +228,10 @@ def libraries():
 
     for name in ("Calibre Library", "Calibre", "calibre", "Books", "Documents/Calibre Library"):
         consider(os.path.join(HOME, name))
-    for root, dirs, _ in os.walk(HOME):
+    deadline = time.monotonic() + LIBRARY_SEARCH_SECONDS
+    for count, (root, dirs, _) in enumerate(os.walk(HOME)):
+        if count >= LIBRARY_SEARCH_DIRS or time.monotonic() > deadline:
+            break                 # a huge home directory: offer what was found so far
         depth = root[len(HOME):].count(os.sep)
         dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("node_modules", "venv")]
         if depth >= 3:
@@ -385,6 +397,116 @@ def read_xml(path):
     return ET.fromstring(data)
 
 
+# Markup from a book is scanned with str.find rather than with regular
+# expressions of the form `<x[^>]*>.*?</x>`: on input with many openings and no
+# closing, each of those restarts its scan at every opening, which is quadratic
+# (320 KB of unclosed <body> tags took 38 seconds). Each function below moves
+# forward only, so its cost is proportional to the text.
+
+def strip_tags(text, repl):
+    """`re.sub(r"<[^>]+>", repl, text)`, in one forward pass."""
+    out, pos = [], 0
+    while True:
+        i = text.find("<", pos)
+        if i < 0:
+            break
+        j = text.find(">", i + 1)
+        if j < 0:
+            break                 # no '>' after this '<', so none after any later one
+        if j == i + 1:            # "<>" is not a tag
+            out.append(text[pos:i + 1])
+            pos = i + 1
+            continue
+        out.append(text[pos:i])
+        out.append(repl)
+        pos = j + 1
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def tag_blocks(text, names, ignore_case=True, accept=None):
+    """Each `<name ...>inner</name>` in `text`, as (start, end, tag, inner).
+
+    The opening tag may be up to MAX_TAG characters, and if `accept` is given
+    it must approve the opening tag's text, or the search moves on one
+    character (so `<aside>` does not swallow the `<a>` inside it). Like the
+    expression it replaces, a block runs to the first matching close, and
+    blocks never overlap.
+    """
+    low = text.lower() if ignore_case else text
+    pos = 0
+    while True:
+        best = None
+        for name in names:
+            i = low.find("<" + name, pos)
+            if i >= 0 and (best is None or i < best[0]):
+                best = (i, name)
+        if best is None:
+            return
+        i, name = best
+        j = low.find(">", i + 1 + len(name), i + 2 + len(name) + MAX_TAG)
+        if j < 0 or (accept and not accept(text[i:j + 1])):
+            pos = i + 1
+            continue
+        close = "</%s>" % name
+        k = low.find(close, j + 1)
+        if k < 0:
+            # Nothing closes this name from here on. Later openings of the
+            # same name cannot close either, so only other names can match.
+            names = tuple(n for n in names if n != name)
+            if not names:
+                return
+            pos = i + 1
+            continue
+        yield i, k + len(close), text[i:j + 1], text[j + 1:k]
+        pos = k + len(close)
+
+
+def without_blocks(text, names):
+    """`text` with every block of the given tags removed, replaced by a space."""
+    out, pos = [], 0
+    for start, end, _, _ in tag_blocks(text, names):
+        out.append(text[pos:start])
+        out.append(" ")
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
+SELF_CLOSING = re.compile(r"<(div|span|p|a|section)")
+
+
+def open_self_closing(text):
+    """`re.sub(r"<(div|span|p|a|section)([^>]*)/>", r"<\\1\\2></\\1>", text)`, in
+    one forward pass: every '<' before the same '>' shares its fate, so each
+    stretch is looked at once rather than once per '<' in it."""
+    out, pos = [], 0
+    while True:
+        i = text.find("<", pos)
+        if i < 0:
+            break
+        j = text.find(">", i)
+        if j < 0:
+            break
+        k, m = i, None
+        if text[j - 1] == "/":
+            while 0 <= k < j:
+                m = SELF_CLOSING.match(text, k)
+                if m and m.end() <= j - 1:
+                    break
+                m = None
+                k = text.find("<", k + 1, j)
+        if m:
+            name = m.group(1)
+            out.append(text[pos:k])
+            out.append("<%s%s></%s>" % (name, text[m.end():j - 1], name))
+        else:
+            out.append(text[pos:j + 1])
+        pos = j + 1
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def text_weight(path):
     """Roughly how much reading a spine file holds, for global page estimates."""
     try:
@@ -392,12 +514,12 @@ def text_weight(path):
             raw = f.read(MAX_CHAPTER_BYTES)
     except OSError:
         return 0
-    raw = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", raw)
-    body = re.search(r"(?is)<body[^>]*>(.*?)</body>", raw)
-    if body:
-        raw = body.group(1)
+    raw = without_blocks(raw, ("script", "style"))
+    for _, _, _, inner in tag_blocks(raw, ("body",)):
+        raw = inner
+        break
     images = len(re.findall(r"(?i)<img\b", raw))
-    raw = html.unescape(re.sub(r"(?s)<[^>]+>", " ", raw))
+    raw = html.unescape(strip_tags(raw, " "))
     return len(re.sub(r"\s+", " ", raw).strip()) + images * 600
 
 
@@ -464,6 +586,55 @@ def cached_meta(meta_path, dest):
             "spine": spine, "toc": toc}
 
 
+def tree_bytes(path):
+    """Bytes held by the files under `path`, not following links."""
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def prune_books(cache_root, keep):
+    """Remove the books opened longest ago until the cache is under its ceiling.
+
+    Each extracted book is a directory named by its hash, with its sanitized
+    images and its listing beside it. The marker file's time is when the book
+    was last opened. `keep` is the book being opened now and is never removed.
+    """
+    books = []
+    try:
+        names = os.listdir(cache_root)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(cache_root, name)
+        if len(name) != 16 or not os.path.isdir(path) or os.path.islink(path):
+            continue
+        try:
+            opened = os.stat(os.path.join(path, ".extracted")).st_mtime
+        except OSError:
+            opened = 0            # never finished: first to go
+        size = tree_bytes(path) + tree_bytes(path + IMAGE_DIR_SUFFIX)
+        books.append((opened, path, size))
+    total = sum(size for _, _, size in books)
+    for _, path, size in sorted(books):
+        if total <= MAX_BOOK_CACHE_BYTES:
+            break
+        if path == keep:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(path + IMAGE_DIR_SUFFIX, ignore_errors=True)
+        try:
+            os.unlink(path + META_SUFFIX)
+        except OSError:
+            pass
+        total -= size
+
+
 def prepare(library, rel, cache_root):
     epub = within(library, rel)
     if not epub or not os.path.isfile(epub):
@@ -472,6 +643,10 @@ def prepare(library, rel, cache_root):
     dest = os.path.join(cache_root, book_key(rel, epub))
     marker = os.path.join(dest, ".extracted")
     if not os.path.isfile(marker):
+        # No marker means no finished extraction, whatever is there: a run
+        # stopped part way (at a limit, or by the system) leaves files behind,
+        # and they are cleared before trying again.
+        shutil.rmtree(dest, ignore_errors=True)
         # Extracted books are the user's private files: keep them private.
         os.makedirs(cache_root, mode=0o700, exist_ok=True)
         os.makedirs(dest, mode=0o700, exist_ok=True)
@@ -479,36 +654,47 @@ def prepare(library, rel, cache_root):
         # earlier versions too.
         os.chmod(cache_root, 0o700)
         os.chmod(dest, 0o700)
-        total = 0
-        with zipfile.ZipFile(epub) as z:
-            for count, m in enumerate(z.infolist()):
-                if count >= MAX_ENTRIES:
-                    break
-                if m.is_dir():
-                    continue
-                target = contained(os.path.join(dest, m.filename), dest)
-                if not target:
-                    continue          # entry tries to escape the cache directory
-                if any(part.startswith(RESERVED_NAMES)
-                       for part in os.path.relpath(target, dest).split(os.sep)):
-                    continue          # entry claims a name this reader owns
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                # Copy with a cap on real bytes: a zip header can understate
-                # how much it expands to, so the declared size proves nothing.
-                written = 0
-                with z.open(m) as src, open(target, "wb") as dst:
-                    while True:
-                        chunk = src.read(65536)
-                        if not chunk:
-                            break
-                        written += len(chunk)
-                        total += len(chunk)
-                        if written > MAX_ENTRY_BYTES or total > MAX_TOTAL_BYTES:
-                            dst.close()
-                            os.unlink(target)
-                            raise ValueError("Book expands to more than this reader will extract")
-                        dst.write(chunk)
+        try:
+            total = 0
+            with zipfile.ZipFile(epub) as z:
+                for count, m in enumerate(z.infolist()):
+                    if count >= MAX_ENTRIES:
+                        break
+                    if m.is_dir():
+                        continue
+                    target = contained(os.path.join(dest, m.filename), dest)
+                    if not target:
+                        continue          # entry tries to escape the cache directory
+                    if any(part.startswith(RESERVED_NAMES)
+                           for part in os.path.relpath(target, dest).split(os.sep)):
+                        continue          # entry claims a name this reader owns
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    # Copy with a cap on real bytes: a zip header can understate
+                    # how much it expands to, so the declared size proves nothing.
+                    written = 0
+                    with z.open(m) as src, open(target, "wb") as dst:
+                        while True:
+                            chunk = src.read(65536)
+                            if not chunk:
+                                break
+                            written += len(chunk)
+                            total += len(chunk)
+                            if written > MAX_ENTRY_BYTES or total > MAX_TOTAL_BYTES:
+                                dst.close()
+                                os.unlink(target)
+                                raise ValueError("Book expands to more than this reader will extract")
+                            dst.write(chunk)
+        except BaseException:
+            # A book that cannot be extracted leaves nothing behind.
+            shutil.rmtree(dest, ignore_errors=True)
+            raise
         open(marker, "w").close()
+        prune_books(cache_root, keep=dest)
+    else:
+        try:
+            os.utime(marker)      # most recently opened, for prune_books()
+        except OSError:
+            pass
 
     # Earlier releases kept the sanitized images and the cached reading order
     # inside the extracted book, where the book's own entries could reach them.
@@ -595,12 +781,20 @@ def prepare(library, rel, cache_root):
         try:
             nav_path = abs_for(nav_href)
             nav_dir = os.path.dirname(nav_path)   # abs_for returned None if it escaped
-            raw = open(nav_path, encoding="utf-8", errors="replace").read()
-            m = re.search(r"<nav[^>]*epub:type=[\"'][^\"']*toc[^\"']*[\"'].*?</nav>", raw, re.S)
-            block = m.group(0) if m else raw
-            for a in re.finditer(r"<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", block, re.S):
-                label = html.unescape(re.sub(r"<[^>]+>", "", a.group(2)))
-                href = os.path.normpath(os.path.join(nav_dir, urllib.parse.unquote(a.group(1).split("#")[0])))
+            with open(nav_path, encoding="utf-8", errors="replace") as f:
+                raw = f.read(MAX_XML_BYTES)
+            block = raw
+            is_toc = lambda tag: re.search(r"epub:type=[\"'][^\"']*toc[^\"']*[\"']", tag)
+            for _, _, tag, inner in tag_blocks(raw, ("nav",), False, is_toc):
+                block = tag + inner + "</nav>"
+                break
+            has_href = lambda tag: re.search(r"href=[\"']([^\"']+)[\"']", tag)
+            for _, _, tag, inner in tag_blocks(block, ("a",), False, has_href):
+                if len(toc) >= MAX_TOC:
+                    break
+                found = has_href(tag)
+                label = html.unescape(strip_tags(inner, ""))
+                href = os.path.normpath(os.path.join(nav_dir, urllib.parse.unquote(found.group(1).split("#")[0])))
                 idx = by_file.get(href)
                 label = re.sub(r"\s+", " ", label).strip()
                 if idx is not None and label:
@@ -637,8 +831,13 @@ def prepare(library, rel, cache_root):
     for idx, label in first.items():
         spine[idx]["title"] = label
 
+    # A spine may list the same file thousands of times; weigh each file once.
+    weights = {}
     for item in spine:
-        item["chars"] = text_weight(item["file"])
+        if item["file"] not in weights:
+            weights[item["file"]] = text_weight(item["file"])
+        item["chars"] = weights[item["file"]]
+    toc = toc[:MAX_TOC]
 
     # Cap the same strings the cached copy is capped at, so reopening a book
     # gives the shell exactly what the first open did.
@@ -897,10 +1096,37 @@ def safe_image(path, root):
 
 
 def parse_css(text, rules):
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-    for m in re.finditer(r"([^{}@]+)\{([^{}]*)\}", text):
+    # Comments, then `selector { body }` pairs, both in one forward pass each.
+    parts, pos = [], 0
+    while True:
+        i = text.find("/*", pos)
+        if i < 0:
+            break
+        j = text.find("*/", i + 2)
+        if j < 0:
+            break
+        parts.append(text[pos:i])
+        pos = j + 2
+    parts.append(text[pos:])
+    text = "".join(parts)
+    pos = 0
+    while True:
+        i = text.find("{", pos)
+        if i < 0:
+            break
+        j = text.find("}", i + 1)
+        if j < 0:
+            break
+        nested = text.find("{", i + 1, j)
+        # The selector is the run before this brace with no brace or '@' in it.
+        start = max(text.rfind("}", pos, i), text.rfind("@", pos, i), pos - 1) + 1
+        if nested >= 0 or start >= i:
+            pos = i + 1
+            continue
+        selector, block = text[start:i], text[i + 1:j]
+        pos = j + 1
         props = {}
-        for decl in m.group(2).split(";"):
+        for decl in block.split(";"):
             if ":" in decl:
                 k, v = decl.split(":", 1)
                 props[k.strip().lower()] = v.strip().lower()
@@ -916,7 +1142,7 @@ def parse_css(text, rules):
             wanted["u"] = True
         if not wanted:
             continue
-        for sel in m.group(1).split(","):
+        for sel in selector.split(","):
             sel = sel.strip()
             if re.fullmatch(r"[a-z0-9]*(\.[\w-]+)?", sel, re.I) and sel:
                 rules.setdefault(sel.lower(), {}).update(wanted)
@@ -1205,8 +1431,20 @@ def chapter(path, max_w, max_h=0, fragment=""):
     with open(path, encoding="utf-8", errors="replace") as f:
         raw = f.read(MAX_CHAPTER_BYTES)
     rules = {}
-    for m in re.finditer(r"<link[^>]+href=[\"']([^\"']+\.css)[\"']", raw, re.I):
-        css = contained(os.path.join(base, urllib.parse.unquote(m.group(1))), root)
+    # Each tag is read once, from its first `<link` to the `>` that ends it.
+    sheets, low, pos = [], raw.lower(), 0
+    for _ in range(2000):
+        i = low.find("<link", pos)
+        if i < 0:
+            break
+        j = low.find(">", i)
+        if j < 0:
+            break                 # nothing after this point ends a tag
+        sheets += re.findall(r"href=[\"']([^\"']+\.css)[\"']", raw[i:j], re.I)
+        pos = j + 1
+    sheets = sheets[:64]
+    for href in sheets:
+        css = contained(os.path.join(base, urllib.parse.unquote(href)), root)
         if not css:
             continue           # stylesheet outside the book
         try:
@@ -1214,10 +1452,10 @@ def chapter(path, max_w, max_h=0, fragment=""):
                 parse_css(f.read(MAX_CHAPTER_BYTES), rules)
         except OSError:
             pass
-    for m in re.finditer(r"<style[^>]*>(.*?)</style>", raw, re.S | re.I):
-        parse_css(m.group(1), rules)
+    for _, _, _, inner in tag_blocks(raw, ("style",)):
+        parse_css(inner, rules)
     # XHTML self-closing on non-void tags confuses HTMLParser (e.g. <div/>).
-    raw = re.sub(r"<(div|span|p|a|section)([^>]*)/>", r"<\1\2></\1>", raw)
+    raw = open_self_closing(raw)
     conv = Converter(path, max_w, max_h, rules, fragment)
     conv.feed(raw)
     conv.close()

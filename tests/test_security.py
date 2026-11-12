@@ -574,6 +574,129 @@ class HelperSecurity(unittest.TestCase):
                               capture_output=True, text=True, timeout=60)
         self.assertIn("took longer than this reader allows", done.stdout)
 
+    # ---- scanning markup in time proportional to it ------------------------
+
+    def assertQuick(self, fn, seconds=3.0):
+        import time
+        start = time.monotonic()
+        fn()
+        self.assertLess(time.monotonic() - start, seconds)
+
+    def test_forward_scans_match_the_expressions_they_replace(self):
+        """strip_tags, tag_blocks and parse_css must give exactly what the old
+        regular expressions gave, on random markup full of edge cases."""
+        import random
+        rng = random.Random(7)
+        atoms = ["<", ">", "<>", "<b>", "</b>", "<script>", "</script>", "<style x>", "</style>",
+                 "<body>", "</body>", "<a href='x'>", "</a>", "<aside>", "<div/>", "<p x/>", "/>", "<span", "<pre/>", "{", "}", "@", "/*",
+                 "*/", "a", " ", "p", ".c", ";", "font-style:italic", ",", "\n"]
+        for _ in range(3000):
+            t = "".join(rng.choice(atoms) for _ in range(rng.randint(0, 30)))
+            self.assertEqual(omlibria.strip_tags(t, " "), re.sub(r"(?s)<[^>]+>", " ", t), t)
+            self.assertEqual(omlibria.without_blocks(t, ("script", "style")),
+                             re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", t), t)
+            want = re.search(r"(?is)<body[^>]*>(.*?)</body>", t)
+            got = next(omlibria.tag_blocks(t, ("body",)), None)
+            self.assertEqual(got[3] if got else None, want.group(1) if want else None, t)
+            want = [(a.group(1), a.group(2)) for a in re.finditer(
+                r"<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", t, re.S)]
+            has = lambda tag: re.search(r"href=[\"']([^\"']+)[\"']", tag)
+            got = [(has(tag).group(1), inner) for _, _, tag, inner
+                   in omlibria.tag_blocks(t, ("a",), False, has)]
+            self.assertEqual(got, want, t)
+            new_rules, old_rules = {}, {}
+            omlibria.parse_css(t, new_rules)
+            text = re.sub(r"/\*.*?\*/", "", t, flags=re.S)
+            for m in re.finditer(r"([^{}@]+)\{([^{}]*)\}", text):
+                omlibria.parse_css(m.group(1) + "{" + m.group(2) + "}", old_rules)
+            self.assertEqual(new_rules, old_rules, t)
+            self.assertEqual(omlibria.open_self_closing(t),
+                             re.sub(r"<(div|span|p|a|section)([^>]*)/>", r"<\1\2></\1>", t), t)
+
+    def test_unclosed_tags_do_not_make_scanning_quadratic(self):
+        """320 KB of unclosed <body> tags took 38 s to weigh before."""
+        for opener in ("<body>", "<script>", "<style>", "<"):
+            path = os.path.join(self.tmp, "w.xhtml")
+            with open(path, "w") as f:
+                f.write(opener * 200000)
+            self.assertQuick(lambda: omlibria.text_weight(path))
+        self.assertQuick(lambda: omlibria.parse_css("a " * 400000 + "{" * 50000, {}))
+        self.assertQuick(lambda: self.chapter("<style>" * 100000 + "<link href='x" * 100000))
+        self.assertQuick(lambda: self.chapter("<div " * 100000 + ">"))
+
+    def test_an_unclosed_navigation_document_is_read_in_linear_time(self):
+        nav = "<nav epub:type='toc'>" + "<a href='ok.xhtml'>" * 100000
+        make_epub(self.epub, {"OEBPS/ok.xhtml": "<p>x</p>", "OEBPS/nav.xhtml": nav},
+                  opf_items=[("ok", "ok.xhtml")])
+        with zipfile.ZipFile(self.epub, "a") as z:
+            z.writestr("OEBPS/content.opf", OPF % (
+                '<item id="ok" href="ok.xhtml" media-type="application/xhtml+xml"/>'
+                '<item id="nav" href="nav.xhtml" properties="nav" media-type="application/xhtml+xml"/>',
+                '<itemref idref="ok"/>'))
+        self.assertQuick(lambda: self.assertEqual(self.prepare()["error"], ""))
+
+    def test_a_file_listed_many_times_in_the_spine_is_weighed_once(self):
+        items = [("c%d" % i, "big.xhtml") for i in range(5000)]
+        make_epub(self.epub, {"OEBPS/big.xhtml": "<p>%s</p>" % ("word " * 400000)}, opf_items=items)
+        self.assertQuick(lambda: self.assertEqual(len(self.prepare()["spine"]), 5000), 10)
+
+    # ---- the extracted-book cache --------------------------------------------
+
+    def test_a_book_that_fails_to_extract_leaves_nothing_behind(self):
+        make_epub(self.epub, {"OEBPS/ok.xhtml": "<p>x</p>", "OEBPS/a.bin": b"\0" * 4096})
+        limit = omlibria.MAX_TOTAL_BYTES
+        omlibria.MAX_TOTAL_BYTES = 1024
+        try:
+            with self.assertRaises(ValueError):
+                self.prepare()
+        finally:
+            omlibria.MAX_TOTAL_BYTES = limit
+        dest = os.path.join(self.cache, omlibria.book_key(self.rel, self.epub))
+        self.assertFalse(os.path.exists(dest), "no partial book is left in the cache")
+
+    def test_a_partial_extraction_from_a_stopped_run_is_cleared(self):
+        make_epub(self.epub, {"OEBPS/ok.xhtml": "<p>x</p>"})
+        dest = os.path.join(self.cache, omlibria.book_key(self.rel, self.epub))
+        os.makedirs(os.path.join(dest, "OEBPS"))
+        with open(os.path.join(dest, "OEBPS", "leftover.bin"), "wb") as f:
+            f.write(b"\0" * 1000)                 # no .extracted marker: never finished
+        self.assertEqual(self.prepare()["error"], "")
+        self.assertFalse(os.path.exists(os.path.join(dest, "OEBPS", "leftover.bin")))
+
+    def test_the_book_cache_drops_the_books_opened_longest_ago(self):
+        names = []
+        for i in range(4):
+            name = "%016x" % i
+            path = os.path.join(self.cache, name)
+            os.makedirs(path)
+            with open(os.path.join(path, "data.bin"), "wb") as f:
+                f.truncate(1000)
+            open(os.path.join(path, ".extracted"), "w").close()
+            os.utime(os.path.join(path, ".extracted"), (100 + i, 100 + i))
+            names.append(path)
+        os.makedirs(os.path.join(self.cache, omlibria.COVER_DIR))
+        ceiling = omlibria.MAX_BOOK_CACHE_BYTES
+        omlibria.MAX_BOOK_CACHE_BYTES = 2500
+        try:
+            omlibria.prune_books(self.cache, keep=names[0])
+        finally:
+            omlibria.MAX_BOOK_CACHE_BYTES = ceiling
+        left = [os.path.exists(p) for p in names]
+        self.assertEqual(left, [True, False, False, True],
+                         "oldest goes first, but never the book being opened")
+        self.assertTrue(os.path.isdir(os.path.join(self.cache, omlibria.COVER_DIR)))
+
+    def test_looking_for_libraries_stops_in_a_huge_home(self):
+        home = os.path.join(self.tmp, "home")
+        for i in range(300):
+            os.makedirs(os.path.join(home, "d%03d" % i, "e"))
+        saved = omlibria.HOME, omlibria.LIBRARY_SEARCH_DIRS
+        omlibria.HOME, omlibria.LIBRARY_SEARCH_DIRS = home, 50
+        try:
+            self.assertEqual(json.loads(run(omlibria.libraries)), [])
+        finally:
+            omlibria.HOME, omlibria.LIBRARY_SEARCH_DIRS = saved
+
     # ---- covers, which come from the library rather than a book -----------
 
     def library_with_cover(self, data, folder="A/B (1)"):

@@ -139,7 +139,8 @@ omarchy-shell omlibria library "/path/to/Calibre Library"
 - `~/.local/state/omarchy/settings/omlibria.json`: library, last book,
   per-book position, font size, panel size, library layout.
 - `~/.cache/omarchy/omlibria/`: extracted EPUBs and sanitized cover copies,
-  safe to delete.
+  safe to delete. Extracted books are capped at 2 GB in all (the books opened
+  longest ago are removed first) and covers at 256 MB.
 
 ## Limits
 
@@ -176,7 +177,8 @@ you install. For Omlibria:
   elements and 6,000 table cells; tables nest two deep and anything deeper is
   flattened. Past a limit the section ends with a note saying so. JPEGs with
   more scans than encoders write are refused, and the helper itself runs under
-  fixed processor, time and memory limits.
+  fixed processor, time and memory limits. Markup is scanned in time
+  proportional to its length, so no arrangement of unclosed tags can stall it.
 - **Every label renders plain text.** A title, a library path or an error
   message is never sniffed for markup, so nothing a book carries can make the
   shell request a URL.
